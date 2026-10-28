@@ -1,0 +1,23 @@
+[package]
+name = "dsk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Disk usage analyzer that finds where space goes and what build artifacts can be reclaimed"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+ratatui = "0.30"
+rayon = "1.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

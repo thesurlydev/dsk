@@ -152,3 +152,7 @@ The scan is a rayon divide-and-conquer walk: entries are stat'd in parallel per
 directory, subdirectories are scanned in parallel, and results are aggregated
 bottom-up into one tree. A scan of 1.2 million files across 290 GB takes about
 5 seconds and peaks around 200 MB of memory.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

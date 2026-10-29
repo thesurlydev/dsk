@@ -2,7 +2,8 @@
 //!
 //! Sizes are allocated blocks (`st_blocks * 512`), matching what `du` and `df`
 //! report, so sparse files and APFS inline data do not inflate totals.
-//! Symlinks are measured, never followed. Hard-linked files are counted once.
+//! Symlinks are measured, never followed. Hard-linked files are counted once,
+//! attributed to the first path in a deterministic name-sorted walk.
 
 use std::collections::HashSet;
 use std::fs::{self, Metadata};
@@ -40,6 +41,13 @@ pub struct Node {
     pub reclaimable: u64,
     /// Set when this directory itself is a generated directory.
     pub artifact: Option<ArtifactKind>,
+    /// Index into `ScanResult::artifacts` for a generated directory.
+    pub artifact_id: Option<u32>,
+    /// The `(device, inode)` key of a regular file with more than one link.
+    pub hardlink: Option<(u64, u64)>,
+    /// True when another path owns this hard-linked file's blocks. The node's
+    /// size is zero and its bytes are counted under that other path.
+    pub shared: bool,
     pub children: Box<[Node]>,
 }
 
@@ -53,6 +61,9 @@ impl Node {
             dirs: 0,
             reclaimable: 0,
             artifact: None,
+            artifact_id: None,
+            hardlink: None,
+            shared: false,
             children: Box::new([]),
         }
     }
@@ -124,7 +135,6 @@ pub fn scan(path: &Path, options: ScanOptions) -> ScanResult {
         root_device: device(&metadata),
         one_file_system: options.one_file_system,
         progress,
-        inodes: InodeSet::new(),
         artifacts: Mutex::new(Vec::new()),
         errors: Mutex::new(Vec::new()),
         error_count: AtomicU64::new(0),
@@ -134,12 +144,13 @@ pub fn scan(path: &Path, options: ScanOptions) -> ScanResult {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
-    let root = scanner.scan_dir(path, name.into(), &metadata, false);
+    let mut root = scanner.scan_dir(path, name.into(), &metadata, false);
 
     let mut errors = scanner.errors.into_inner().unwrap_or_default();
     errors.sort();
     let error_count = scanner.error_count.load(Ordering::Relaxed);
     let mut artifacts = scanner.artifacts.into_inner().unwrap_or_default();
+    dedup_hardlinks(&mut root, &mut artifacts);
     artifacts.sort_unstable_by_key(|artifact| std::cmp::Reverse(artifact.size));
     ScanResult {
         stats: ScanStats {
@@ -158,7 +169,6 @@ struct Scanner {
     root_device: u64,
     one_file_system: bool,
     progress: Option<Arc<Progress>>,
-    inodes: InodeSet,
     artifacts: Mutex<Vec<ArtifactDir>>,
     errors: Mutex<Vec<String>>,
     error_count: AtomicU64,
@@ -246,6 +256,9 @@ impl Scanner {
                     dirs: 0,
                     reclaimable: 0,
                     artifact: None,
+                    artifact_id: None,
+                    hardlink: inode_key(&metadata),
+                    shared: false,
                     children: Box::new([]),
                 }
             })
@@ -269,7 +282,6 @@ impl Scanner {
         }
         self.record_artifact(path, &mut node);
 
-        children.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
         node.children = children.into_boxed_slice();
         node
     }
@@ -278,11 +290,6 @@ impl Scanner {
         let bytes = disk_usage(metadata);
         if let Some(progress) = &self.progress {
             progress.file(bytes);
-        }
-        if let Some(key) = inode_key(metadata)
-            && self.inodes.seen(key)
-        {
-            return 0;
         }
         bytes
     }
@@ -293,11 +300,13 @@ impl Scanner {
         };
         node.reclaimable = node.size;
         if let Ok(mut artifacts) = self.artifacts.lock() {
+            let id = artifacts.len() as u32;
             artifacts.push(ArtifactDir {
                 kind,
                 path: path.to_path_buf(),
                 size: node.size,
             });
+            node.artifact_id = Some(id);
         }
     }
 
@@ -311,26 +320,61 @@ impl Scanner {
     }
 }
 
-/// A set of `(device, inode)` pairs split into shards to keep contention low.
-struct InodeSet {
-    shards: [Mutex<HashSet<(u64, u64)>>; 16],
+/// Attribute every hard-linked file to one path: the first one met in a walk
+/// that visits directory entries in name order. Later paths for the same inode
+/// keep their entry but drop to zero bytes and are marked `shared`, so totals
+/// match `du` while the choice of owner does not depend on scan scheduling.
+fn dedup_hardlinks(root: &mut Node, artifacts: &mut [ArtifactDir]) {
+    dedup_node(root, &mut HashSet::new(), artifacts);
 }
 
-impl InodeSet {
-    fn new() -> Self {
-        Self {
-            shards: std::array::from_fn(|_| Mutex::new(HashSet::new())),
+/// Returns the bytes removed from this subtree, so parents can shrink by the
+/// same amount without walking the tree twice.
+fn dedup_node(
+    node: &mut Node,
+    seen: &mut HashSet<(u64, u64)>,
+    artifacts: &mut [ArtifactDir],
+) -> u64 {
+    if node.kind == NodeKind::File {
+        let Some(key) = node.hardlink else {
+            return 0;
+        };
+        if seen.insert(key) {
+            return 0;
         }
+        node.shared = true;
+        let removed = node.size;
+        node.size = 0;
+        return removed;
+    }
+    if node.kind != NodeKind::Dir {
+        return 0;
     }
 
-    /// Record a key, returning true when it had already been seen.
-    fn seen(&self, key: (u64, u64)) -> bool {
-        let shard = (key.1 as usize) % self.shards.len();
-        match self.shards[shard].lock() {
-            Ok(mut set) => !set.insert(key),
-            Err(_) => false,
-        }
+    // Ownership is decided in name order; display order goes back to largest
+    // first once the subtree has been adjusted.
+    node.children.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    let mut removed = 0;
+    for child in node.children.iter_mut() {
+        removed += dedup_node(child, seen, artifacts);
     }
+    node.size = node.size.saturating_sub(removed);
+
+    if node.artifact.is_some() {
+        node.reclaimable = node.size;
+        if let Some(artifact) = node
+            .artifact_id
+            .and_then(|id| artifacts.get_mut(id as usize))
+        {
+            artifact.size = node.size;
+        }
+    } else {
+        node.reclaimable = node.children.iter().map(|child| child.reclaimable).sum();
+    }
+
+    node.children
+        .sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+    removed
 }
 
 #[cfg(unix)]
@@ -497,6 +541,68 @@ mod tests {
         // Two directory entries, one allocation.
         assert!(result.root.size < one * 2);
         assert!(result.root.size >= one);
+    }
+
+    #[test]
+    fn the_first_name_owns_a_hard_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("alpha")).unwrap();
+        fs::create_dir_all(tmp.path().join("beta")).unwrap();
+        let original = tmp.path().join("alpha/one");
+        fs::write(&original, vec![9u8; 128 * 1024]).unwrap();
+        fs::hard_link(&original, tmp.path().join("beta/two")).unwrap();
+        let allocated = fs::metadata(&original).unwrap().blocks() * 512;
+
+        // The owner must not depend on directory read order or scan scheduling.
+        for _ in 0..5 {
+            let result = scan(tmp.path(), options());
+            let alpha = child(&result.root, "alpha");
+            let beta = child(&result.root, "beta");
+            let one = child(alpha, "one");
+            let two = child(beta, "two");
+
+            assert_eq!(one.size, allocated);
+            assert!(!one.shared);
+            assert_eq!(two.size, 0);
+            assert!(two.shared, "the second name is marked as shared");
+            assert!(result.root.size < allocated * 2);
+            assert!(result.root.size >= allocated);
+        }
+    }
+
+    #[test]
+    fn artifacts_exclude_blocks_owned_outside_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let outside = tmp.path().join("alpha");
+        fs::create_dir_all(project.join("target")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(project.join("Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+        let blob = project.join("target/blob");
+        fs::write(&blob, vec![0u8; 512 * 1024]).unwrap();
+        fs::hard_link(&blob, outside.join("copy")).unwrap();
+
+        let result = scan(tmp.path(), options());
+        let target = child(child(&result.root, "project"), "target");
+        let own = fs::metadata(project.join("target")).unwrap().blocks() * 512;
+
+        // "alpha" sorts before "project", so it owns the shared blocks and the
+        // artifact only contains its own directory blocks.
+        assert_eq!(target.size, own);
+        assert_eq!(target.reclaimable, own);
+        let artifact = result
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path == project.join("target"))
+            .unwrap();
+        assert_eq!(artifact.size, own);
+    }
+
+    fn child<'a>(node: &'a Node, name: &str) -> &'a Node {
+        node.children
+            .iter()
+            .find(|child| child.name.as_ref() == name)
+            .unwrap_or_else(|| panic!("{name} is not a child of {}", node.name))
     }
 
     #[test]

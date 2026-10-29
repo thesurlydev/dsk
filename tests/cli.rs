@@ -60,10 +60,39 @@ fn allocated_bytes(path: &Path) -> u64 {
     total
 }
 
+/// Allocated bytes with hard links counted once, like `du` and dsk.
+fn deduped_allocated_bytes(path: &Path) -> u64 {
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    let mut total = fs::symlink_metadata(path).unwrap().blocks() * 512;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            let key = (metadata.dev(), metadata.ino());
+            if metadata.is_file() && metadata.nlink() > 1 && !seen.insert(key) {
+                continue;
+            }
+            total += metadata.blocks() * 512;
+            if metadata.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    total
+}
+
 #[test]
 fn json_total_matches_allocated_blocks() {
     let tmp = fixture();
-    let output = dsk(&["--json", "--no-progress", tmp.path().to_str().unwrap()]);
+    let output = dsk(&[
+        "report",
+        "--json",
+        "--no-progress",
+        tmp.path().to_str().unwrap(),
+    ]);
     assert!(output.status.success(), "{}", stderr(&output));
     let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
     assert_eq!(
@@ -83,9 +112,47 @@ fn json_total_matches_allocated_blocks() {
 }
 
 #[test]
+fn json_attributes_hard_links_to_one_path_deterministically() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join("alpha")).unwrap();
+    fs::create_dir_all(tmp.path().join("beta")).unwrap();
+    let original = tmp.path().join("alpha/one");
+    fs::write(&original, vec![5u8; 128 * 1024]).unwrap();
+    fs::hard_link(&original, tmp.path().join("beta/two")).unwrap();
+
+    let run = || {
+        let output = dsk(&[
+            "report",
+            "--json",
+            "--no-progress",
+            tmp.path().to_str().expect("utf-8 fixture path"),
+        ]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        serde_json::from_str::<serde_json::Value>(&stdout(&output)).unwrap()
+    };
+
+    let first = run();
+    assert_eq!(
+        first["total_bytes"].as_u64().unwrap(),
+        deduped_allocated_bytes(tmp.path())
+    );
+    let first_entries = first["top_level"].clone();
+    assert_eq!(
+        run()["top_level"],
+        first_entries,
+        "the owner of a hard link must not change between scans"
+    );
+}
+
+#[test]
 fn report_has_sections_and_no_ansi_when_piped() {
     let tmp = fixture();
-    let output = dsk(&["--no-progress", "--no-color", tmp.path().to_str().unwrap()]);
+    let output = dsk(&[
+        "report",
+        "--no-progress",
+        "--no-color",
+        tmp.path().to_str().unwrap(),
+    ]);
     assert!(output.status.success());
     let text = stdout(&output);
     assert!(text.contains("top-level entries"));
@@ -99,6 +166,7 @@ fn report_has_sections_and_no_ansi_when_piped() {
 fn tree_mode_prints_structure() {
     let tmp = fixture();
     let output = dsk(&[
+        "report",
         "--tree",
         "--depth",
         "2",
@@ -192,6 +260,20 @@ fn tui_requires_a_terminal() {
     ]);
     assert!(!output.status.success());
     assert!(stderr(&output).contains("interactive terminal"));
+}
+
+#[test]
+fn bare_dsk_opens_the_tui() {
+    let tmp = fixture();
+    let output = dsk(&["--no-progress", "--quiet", tmp.path().to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("interactive terminal"));
+}
+
+#[test]
+fn report_flags_require_the_report_subcommand() {
+    let output = dsk(&["--json"]);
+    assert!(!output.status.success());
 }
 
 #[test]

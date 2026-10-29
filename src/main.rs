@@ -29,12 +29,29 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<u8> {
     match cli.command {
-        Some(Command::Tui(args)) => {
+        Some(Command::Tui(args)) => run_tui(args.path, &args.scan),
+        None => run_tui(cli.path, &cli.scan),
+        Some(Command::Report(args)) => {
             setup_threads(args.scan.threads)?;
             let root = resolve(args.path)?;
             let result = scan_tree(&root, &args.scan);
-            warn_errors(&result, &args.scan);
-            tui::run(result.root, &root)?;
+            if args.report.json {
+                warn_errors(&result, &args.scan);
+            }
+            let options = report::ReportOptions {
+                top: args.report.top,
+                all: args.report.all,
+                tree: args.report.tree,
+                depth: args.report.depth,
+                sort: args.report.sort,
+            };
+            let text = if args.report.json {
+                report::json(&result, &root, &options)?
+            } else {
+                let paint = color::Paint::auto(args.report.no_color, io::stdout().is_terminal());
+                report::report(&result, &root, &options, paint)
+            };
+            write_stdout(&text)?;
             Ok(0)
         }
         Some(Command::Clean(args)) => {
@@ -44,30 +61,16 @@ fn run(cli: Cli) -> Result<u8> {
             warn_errors(&result, &args.scan);
             clean::run(&result, &root, &args)
         }
-        None => {
-            setup_threads(cli.scan.threads)?;
-            let root = resolve(cli.path)?;
-            let result = scan_tree(&root, &cli.scan);
-            if cli.report.json {
-                warn_errors(&result, &cli.scan);
-            }
-            let options = report::ReportOptions {
-                top: cli.report.top,
-                all: cli.report.all,
-                tree: cli.report.tree,
-                depth: cli.report.depth,
-                sort: cli.report.sort,
-            };
-            let text = if cli.report.json {
-                report::json(&result, &root, &options)?
-            } else {
-                let paint = color::Paint::auto(cli.report.no_color, io::stdout().is_terminal());
-                report::report(&result, &root, &options, paint)
-            };
-            write_stdout(&text)?;
-            Ok(0)
-        }
     }
+}
+
+fn run_tui(path: Option<PathBuf>, scan: &cli::ScanArgs) -> Result<u8> {
+    setup_threads(scan.threads)?;
+    let root = resolve(path)?;
+    let result = scan_tree(&root, scan);
+    warn_errors(&result, scan);
+    tui::run(result.root, &root, scan_options(scan, false))?;
+    Ok(0)
 }
 
 fn resolve(path: Option<PathBuf>) -> Result<PathBuf> {
@@ -95,13 +98,14 @@ fn setup_threads(threads: Option<usize>) -> Result<()> {
 
 fn scan_tree(root: &std::path::Path, args: &cli::ScanArgs) -> scan::ScanResult {
     let progress = !args.no_progress && !args.quiet && io::stderr().is_terminal();
-    scan::scan(
-        root,
-        scan::ScanOptions {
-            one_file_system: args.one_file_system,
-            progress,
-        },
-    )
+    scan::scan(root, scan_options(args, progress))
+}
+
+fn scan_options(args: &cli::ScanArgs, progress: bool) -> scan::ScanOptions {
+    scan::ScanOptions {
+        one_file_system: args.one_file_system,
+        progress,
+    }
 }
 
 fn warn_errors(result: &scan::ScanResult, args: &cli::ScanArgs) {

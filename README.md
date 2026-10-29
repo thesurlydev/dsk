@@ -11,7 +11,7 @@ routinely account for most of the space. On the machine this was written for,
 243.5 GB of that was 40 Cargo target directories.
 
 ```
-$ dsk ~/projects
+$ dsk report ~/projects
 dsk 0.1.0  /Users/shane/projects
   269.9G on disk  1,185,755 files  109,068 dirs  5.2s
 
@@ -58,12 +58,13 @@ cargo build --release
 ## Usage
 
 ```
-dsk [OPTIONS] [PATH]          report on PATH (default: current directory)
-dsk tui [OPTIONS] [PATH]      browse interactively
+dsk [OPTIONS] [PATH]          browse PATH interactively (default: current directory)
+dsk tui [OPTIONS] [PATH]      same as above, spelled out
+dsk report [OPTIONS] [PATH]   print a summary report
 dsk clean [OPTIONS] [PATH]    delete regenerable build output
 ```
 
-Useful report flags:
+Useful `dsk report` flags:
 
 - `--tree` prints an ASCII tree (with `--depth`, default 3).
 - `--top N` sets entries per section (default 10); `--all` shows everything.
@@ -74,24 +75,41 @@ Useful report flags:
 
 ### TUI
 
-`dsk tui` opens a drill-down browser with the same tree and artifact tags.
+Plain `dsk` (or `dsk tui`) opens a drill-down browser with the same tree and artifact tags.
 
 | key | action |
 | --- | --- |
 | `j` / `k`, arrows | move |
 | `enter` / `l` / right | open directory |
 | `backspace` / `h` / left | go up |
-| `g` / `G`, home / end | jump to start / end |
+| `home`, `end` / `G` | jump to start / end |
+| `g` | go to a directory by path |
 | `s` | cycle sort: size, file count, name |
 | `f` | show or hide files (directories only) |
+| `t` | toggle the light/dark color theme |
 | `c` | run `cargo clean` for the selected Cargo project or target (asks first) |
+| `d` | delete the selected file or directory (asks first) |
 | `q` / escape | quit |
 
 The footer shows the selected path, its share of the current directory, and the
-command that would reclaim it. Pressing `c` on a directory that contains a
-`Cargo.toml`, or on a detected Cargo `target/` directory, opens a confirmation
-modal; confirming runs `cargo clean --manifest-path ...` and updates the tree in
-place.
+command that would reclaim it. A row whose blocks are counted under another
+path shows `0B` and a `[link]` tag; selecting it explains that in the footer.
+The TUI starts in the dark palette; press `t` at any time to switch to the light
+palette, and the footer shows which is active.
+Pressing `c` on a directory that contains a `Cargo.toml`, or on a detected Cargo
+`target/` directory, opens a confirmation modal; confirming runs
+`cargo clean --manifest-path ...` and updates the tree in place.
+
+Pressing `d` opens the same kind of confirmation for whatever is selected, file
+or directory, and deletes it once confirmed. Symlinks are unlinked, never
+followed, and the entry is re-checked immediately before deletion so it must
+still exist and resolve inside the scan root.
+
+Pressing `g` opens a path prompt. The path may be absolute or relative to the
+directory currently on screen, and a leading `~` expands to your home
+directory. On enter, dsk rescans that directory and reopens the browser there.
+If the path cannot be accessed or is not a directory, the prompt stays open
+with the error so it can be corrected.
 
 ### Cleaning
 
@@ -133,6 +151,11 @@ directory are counted once, as part of the outer directory.
 - Symlinks are measured and never followed, so there are no cycles and no
   double counting through links.
 - Hard-linked files are counted once per `(device, inode)` pair, like `du`.
+  The first path in a name-sorted walk owns the blocks; later paths show `0B`
+  and a `[link]` tag, so a directory holding only a second link can read `0B`
+  even though the file has content. Selecting that row explains it in the
+  footer. Ownership is deterministic for a scan root, but `g` rescans only the
+  subtree you enter, so a link whose partner lies outside it is counted there.
 - Unreadable paths are reported and excluded from the totals; the scan does not
   abort.
 - Directory inodes count toward their parent, matching `du`.
@@ -151,7 +174,7 @@ cargo fmt --check
 The scan is a rayon divide-and-conquer walk: entries are stat'd in parallel per
 directory, subdirectories are scanned in parallel, and results are aggregated
 bottom-up into one tree. A scan of 1.2 million files across 290 GB takes about
-5 seconds and peaks around 200 MB of memory.
+5 seconds and peaks around 250 MB of memory.
 
 ## License
 

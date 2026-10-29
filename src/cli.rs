@@ -15,9 +15,9 @@ use crate::artifact::ArtifactKind;
                   build artifacts (Cargo target dirs, node_modules, caches) that can be \
                   deleted to reclaim space without losing source code.",
     after_help = "Examples:\n  \
-        dsk                     report on the current directory\n  \
-        dsk ~/projects          report on another tree\n  \
-        dsk tui ~/projects      browse interactively\n  \
+        dsk                     browse the current directory interactively\n  \
+        dsk ~/projects          browse another tree\n  \
+        dsk report ~/projects   print a summary report\n  \
         dsk clean ~/projects    preview reclaimable rust/node artifacts, then delete"
 )]
 pub struct Cli {
@@ -28,17 +28,16 @@ pub struct Cli {
     #[command(flatten)]
     pub scan: ScanArgs,
 
-    #[command(flatten)]
-    pub report: ReportArgs,
-
     #[command(subcommand)]
     pub command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Browse disk usage interactively
+    /// Browse disk usage interactively (the default)
     Tui(TuiArgs),
+    /// Print a summary report
+    Report(ReportCmdArgs),
     /// Delete generated build artifacts
     Clean(CleanArgs),
 }
@@ -91,6 +90,19 @@ pub struct ReportArgs {
     /// Disable color output
     #[arg(long)]
     pub no_color: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ReportCmdArgs {
+    /// Directory to scan (default: current directory)
+    #[arg(value_name = "PATH")]
+    pub path: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub scan: ScanArgs,
+
+    #[command(flatten)]
+    pub report: ReportArgs,
 }
 
 #[derive(Args, Debug)]
@@ -191,9 +203,25 @@ mod tests {
     fn parses_subcommands_and_paths() {
         let cli = Cli::try_parse_from(["dsk", "tui", "/tmp"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Tui(_))));
-        let cli = Cli::try_parse_from(["dsk", "/tmp", "--top", "4"]).unwrap();
+        let cli = Cli::try_parse_from(["dsk", "report", "/tmp", "--top", "4"]).unwrap();
+        let Some(Command::Report(args)) = cli.command else {
+            panic!("expected the report subcommand");
+        };
+        assert_eq!(args.path, Some(PathBuf::from("/tmp")));
+        assert_eq!(args.report.top, 4);
+    }
+
+    #[test]
+    fn bare_invocation_has_no_subcommand() {
+        let cli = Cli::try_parse_from(["dsk", "/tmp", "-x"]).unwrap();
+        assert!(cli.command.is_none());
         assert_eq!(cli.path, Some(PathBuf::from("/tmp")));
-        assert_eq!(cli.report.top, 4);
+        assert!(cli.scan.one_file_system);
+    }
+
+    #[test]
+    fn report_flags_need_the_report_subcommand() {
+        assert!(Cli::try_parse_from(["dsk", "--json"]).is_err());
     }
 
     #[test]

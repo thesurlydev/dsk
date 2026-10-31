@@ -1,0 +1,19 @@
+[tasks.build]
+description = "Build the release binary"
+run = "cargo build --release"
+
+[tasks.test]
+description = "Run the test suite"
+run = "cargo test"
+
+[tasks.install]
+description = "Install dsk from this checkout"
+run = "cargo install --path ."
+
+[tasks.fmt]
+description = "Check formatting"
+run = "cargo fmt --check"
+
+[tasks.lint]
+description = "Run clippy with warnings denied"
+run = "cargo clippy --all-targets -- -D warnings"

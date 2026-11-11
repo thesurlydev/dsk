@@ -2,6 +2,7 @@ mod artifact;
 mod clean;
 mod cli;
 mod color;
+mod disk;
 mod format;
 mod git;
 mod report;

@@ -439,6 +439,7 @@ dependencies = [
  "clap",
  "ratatui",
  "rayon",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

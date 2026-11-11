@@ -92,6 +92,17 @@ Plain `dsk` (or `dsk tui`) opens a drill-down browser with the same tree and art
 | `w` | remove unused worktrees and branches of the selected git checkout (asks first) |
 | `q` / escape | quit |
 
+The header has two lines. The first is the size, file and directory counts, and
+reclaimable space of the directory being viewed. The second is the capacity of
+the filesystem that directory lives on: how much is in use, a usage bar, and how
+much is still free. It follows the filesystem as you navigate, so scanning one
+project never hides how full the disk is, and it is re-read after a clean or
+delete. Used space is the filesystem total minus the free blocks, so used plus
+free is the total; that counts filesystem metadata and reserved space as used,
+which is why it can read slightly higher than `df`'s `Used` column. Free space is
+what a non-root process can still allocate, which is `df`'s `Avail` column. The
+bar drops out on narrow terminals so the free figure stays visible.
+
 The footer shows the selected path, its share of the current directory, and the
 command that would reclaim it. A row whose blocks are counted under another
 path shows `0B` and a `[link]` tag; selecting it explains that in the footer.

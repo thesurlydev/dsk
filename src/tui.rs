@@ -15,6 +15,7 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::artifact::{self, ArtifactKind};
+use crate::disk::{self, DiskUsage};
 use crate::format::{
     bytes, display_path, percent, plural, right, shell_path, truncate_left, truncate_right,
 };
@@ -45,6 +46,9 @@ struct App {
     theme: Theme,
     /// Scan settings used when the user opens a different directory with `g`.
     scan: ScanOptions,
+    /// Capacity of the filesystem holding the directory being viewed. Refreshed
+    /// with the directory listing so it follows navigations.
+    disk: Option<DiskUsage>,
     state: TableState,
     quit: bool,
     modal: Option<Modal>,
@@ -251,6 +255,7 @@ impl App {
             show_files: true,
             theme: Theme::Dark,
             scan,
+            disk: None,
             state: TableState::default(),
             quit: false,
             modal: None,
@@ -358,6 +363,11 @@ impl App {
         } else {
             self.selected = self.selected.min(self.order.len() - 1);
         }
+
+        // Read alongside the listing so the figure follows navigation across
+        // mount points and reflects anything just deleted.
+        let path = self.current_path();
+        self.disk = disk::usage(&path);
     }
 
     fn handle_key(&mut self, code: KeyCode) {
@@ -970,8 +980,9 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
+        let header = if self.disk.is_some() { 4 } else { 3 };
         let chunks = Layout::vertical([
-            Constraint::Length(3),
+            Constraint::Length(header),
             Constraint::Min(3),
             Constraint::Length(4),
         ])
@@ -1010,10 +1021,60 @@ impl App {
                 Style::new().fg(Color::Green),
             ),
         ]);
+
+        // Line two is the whole filesystem, not just the scanned tree: how much
+        // of the disk holding this directory is used, and how much is free.
+        let mut lines = vec![line];
+        if let Some(usage) = self.disk {
+            lines.push(self.draw_disk_usage(usage, area));
+        }
         frame.render_widget(
-            Paragraph::new(line).block(Block::bordered().title(title)),
+            Paragraph::new(lines).block(Block::bordered().title(title)),
             area,
         );
+    }
+
+    /// The second header line. It degrades with the terminal width, keeping the
+    /// free figure longest because that is what answers "how much room is left".
+    fn draw_disk_usage(&self, usage: DiskUsage, area: Rect) -> Line<'static> {
+        let width = area.width.saturating_sub(2) as usize;
+        let accent = Style::new().fg(self.theme.accent());
+        let free = Style::new().fg(Color::Green);
+        let muted = Style::new().fg(self.theme.muted());
+
+        let pair = format!("{} of {} used", bytes(usage.used), bytes(usage.total));
+        let spare = format!("{} free", bytes(usage.free));
+        let gauge = format!(
+            "{}  {}%",
+            bar(usage.used, usage.total, 10),
+            usage.used_percent()
+        );
+
+        let full = format!("disk  {pair}  {gauge}  {spare}");
+        if full.chars().count() <= width {
+            return Line::from(vec![
+                Span::styled("disk  ", muted),
+                Span::styled(pair, accent),
+                Span::raw(format!("  {gauge}  ")),
+                Span::styled(spare, free),
+            ]);
+        }
+        let without_bar = format!("disk  {pair}  {spare}");
+        if without_bar.chars().count() <= width {
+            return Line::from(vec![
+                Span::styled("disk  ", muted),
+                Span::styled(pair, accent),
+                Span::raw("  "),
+                Span::styled(spare, free),
+            ]);
+        }
+        let only_free = format!("disk  {spare}");
+        let text = if only_free.chars().count() <= width {
+            only_free
+        } else {
+            spare
+        };
+        Line::from(Span::styled(truncate_right(&text, width), free))
     }
 
     fn draw_table(&mut self, frame: &mut Frame, area: Rect) {
@@ -1737,6 +1798,60 @@ mod tests {
             .collect();
         assert!(screen.contains("[link]"), "{screen}");
         assert!(screen.contains("counted under another path"), "{screen}");
+    }
+
+    #[test]
+    fn the_header_shows_usage_of_the_whole_filesystem() {
+        let (tmp, result) = tree();
+        let mut app = App::new(result.root, tmp.path(), ScanOptions::default());
+        // Disk usage moves while the test runs, so assert against what the app
+        // recorded rather than re-reading the filesystem.
+        let Some(usage) = app.disk else {
+            return; // filesystem without statvfs in this environment
+        };
+        assert!(usage.total > 0);
+
+        let shown = screen(&mut app);
+        assert!(
+            shown.contains(&format!(
+                "{} of {} used",
+                bytes(usage.used),
+                bytes(usage.total)
+            )),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(&format!("{} free", bytes(usage.free))),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(&format!("{}%", usage.used_percent())),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_header_still_shows_free_space() {
+        let (tmp, result) = tree();
+        let mut app = App::new(result.root, tmp.path(), ScanOptions::default());
+        let Some(usage) = app.disk else {
+            return; // filesystem without statvfs in this environment
+        };
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(48, 20)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let shown: String = buffer
+            .content()
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            shown.contains(&format!("{} free", bytes(usage.free))),
+            "{shown}"
+        );
     }
 
     #[test]

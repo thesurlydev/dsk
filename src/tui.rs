@@ -895,6 +895,7 @@ impl App {
         node.files = node.files.saturating_sub(removed.files);
         node.dirs = node.dirs.saturating_sub(removed.dirs);
         node.reclaimable = node.reclaimable.saturating_sub(removed.reclaimable);
+        node.roll_up_split();
         removed
     }
 
@@ -935,6 +936,7 @@ impl App {
         node.files = node.files.saturating_sub(removed.files);
         node.dirs = node.dirs.saturating_sub(removed.dirs);
         node.reclaimable = node.reclaimable.saturating_sub(removed.reclaimable);
+        node.roll_up_split();
         removed
     }
 
@@ -1020,6 +1022,16 @@ impl App {
                 format!("  |  {} reclaimable here", bytes(current.reclaimable)),
                 Style::new().fg(Color::Green),
             ),
+            Span::styled(
+                format!(
+                    "  |  target {} ({})  worktree {} ({})",
+                    bytes(current.target_bytes),
+                    percent(current.target_bytes, current.size),
+                    bytes(current.worktree_bytes),
+                    percent(current.worktree_bytes, current.size),
+                ),
+                Style::new().fg(self.theme.muted()),
+            ),
         ]);
 
         // Line two is the whole filesystem, not just the scanned tree: how much
@@ -1090,10 +1102,11 @@ impl App {
                 } else {
                     node.name.to_string()
                 };
-                let tag = match (node.artifact, node.shared) {
-                    (Some(kind), _) => format!("[{}]", kind.short()),
-                    (None, true) => "[link]".to_string(),
-                    (None, false) => String::new(),
+                let tag = match (node.artifact, node.shared, node.worktree) {
+                    (Some(kind), _, _) => format!("[{}]", kind.short()),
+                    (None, true, _) => "[link]".to_string(),
+                    (None, false, true) => "[wt]".to_string(),
+                    (None, false, false) => String::new(),
                 };
                 let bar = bar(node.size, total, 10);
                 Row::new(vec![
@@ -1103,6 +1116,8 @@ impl App {
                     )),
                     Cell::from(right(&percent(node.size, total), 6)),
                     Cell::from(bar),
+                    self.split_cell(node.target_bytes, 7),
+                    self.split_cell(node.worktree_bytes, 8),
                     Cell::from(label),
                     Cell::from(Span::styled(tag, Style::new().fg(self.theme.tag()))),
                 ])
@@ -1113,6 +1128,8 @@ impl App {
             Cell::from(right("size", 7)),
             Cell::from(right("share", 6)),
             Cell::from("usage"),
+            Cell::from(right("target", 7)),
+            Cell::from(right("worktree", 8)),
             Cell::from("name"),
             Cell::from("kind"),
         ])
@@ -1124,6 +1141,8 @@ impl App {
                 Constraint::Length(7),
                 Constraint::Length(6),
                 Constraint::Length(10),
+                Constraint::Length(7),
+                Constraint::Length(8),
                 Constraint::Min(10),
                 Constraint::Length(9),
             ],
@@ -1139,13 +1158,28 @@ impl App {
                     "  empty directory",
                     Style::new().fg(self.theme.muted()),
                 ))
-                .block(Block::bordered().title(" size    share  usage       name")),
+                .block(
+                    Block::bordered().title(" size    share  usage       target  worktree  name"),
+                ),
                 area,
             );
             return;
         }
         self.state.select(Some(self.selected));
         frame.render_stateful_widget(table, area, &mut self.state);
+    }
+
+    /// A target or worktree figure for one row; zero reads as a dim `-` so the
+    /// directories that do hold build output or worktrees stand out.
+    fn split_cell(&self, value: u64, width: usize) -> Cell<'static> {
+        if value == 0 {
+            Cell::from(Span::styled(
+                right("-", width),
+                Style::new().fg(self.theme.muted()),
+            ))
+        } else {
+            Cell::from(right(&bytes(value), width))
+        }
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
@@ -1206,6 +1240,13 @@ impl App {
                     if let Some(command) = kind.clean_command(&path) {
                         text.push_str(&format!("  {command}"));
                     }
+                }
+                if node.target_bytes > 0 || node.worktree_bytes > 0 {
+                    text.push_str(&format!(
+                        "  target {}  worktree {}",
+                        bytes(node.target_bytes),
+                        bytes(node.worktree_bytes)
+                    ));
                 }
                 if node.shared {
                     text.push_str("  [link] blocks counted under another path");

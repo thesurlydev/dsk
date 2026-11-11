@@ -1,5 +1,6 @@
 //! Interactive browser for a scanned tree.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -17,6 +18,7 @@ use crate::artifact::{self, ArtifactKind};
 use crate::format::{
     bytes, display_path, percent, plural, right, shell_path, truncate_left, truncate_right,
 };
+use crate::git;
 use crate::report::SortKey;
 use crate::scan::{Node, NodeKind, ScanOptions};
 
@@ -65,11 +67,14 @@ enum Modal {
 enum Confirmation {
     Clean(CleanTarget),
     Delete(DeleteTarget),
+    Git(GitTarget),
 }
 
 enum Action {
     Confirm(Confirmation),
     Go(String),
+    /// Work out which worktrees and branches of this checkout are unused.
+    PlanGit(PathBuf),
 }
 
 struct GoPrompt {
@@ -205,6 +210,18 @@ struct DeleteTarget {
     estimate: u64,
 }
 
+struct GitTarget {
+    plan: git::Plan,
+    /// Space the scan attributed to each worktree in `plan.worktrees`.
+    sizes: Vec<u64>,
+}
+
+impl GitTarget {
+    fn estimate(&self) -> u64 {
+        self.sizes.iter().sum()
+    }
+}
+
 #[derive(Default)]
 struct Removed {
     size: u64,
@@ -262,7 +279,11 @@ impl App {
                 Some(Action::Confirm(Confirmation::Delete(target))) => {
                     self.run_delete(terminal, target)?
                 }
+                Some(Action::Confirm(Confirmation::Git(target))) => {
+                    self.run_git_clean(terminal, target)?
+                }
                 Some(Action::Go(input)) => self.run_go(terminal, input)?,
+                Some(Action::PlanGit(path)) => self.run_git_plan(terminal, path)?,
                 None => {}
             }
         }
@@ -399,6 +420,7 @@ impl App {
             KeyCode::Char('g') => self.request_go(),
             KeyCode::Char('c') => self.request_clean(),
             KeyCode::Char('d') => self.request_delete(),
+            KeyCode::Char('w') => self.request_git_clean(),
             _ => {}
         }
     }
@@ -554,6 +576,181 @@ impl App {
         })));
     }
 
+    fn request_git_clean(&mut self) {
+        let path = match self.selected_node() {
+            Some(node) if node.is_dir() => self.selected_path(),
+            _ => None,
+        };
+        match path {
+            Some(path) if git::is_checkout(&path) => self.pending = Some(Action::PlanGit(path)),
+            _ => {
+                self.status = Some(
+                    "select a git checkout (a directory with .git) to clean worktrees and branches"
+                        .to_string(),
+                )
+            }
+        }
+    }
+
+    fn run_git_plan(&mut self, terminal: &mut DefaultTerminal, path: PathBuf) -> Result<()> {
+        self.modal = Some(Modal::Notice {
+            title: "git cleanup".to_string(),
+            lines: vec![
+                format!("checking worktrees and branches in {}", display_path(&path)),
+                "this can take a moment".to_string(),
+            ],
+            ok: true,
+        });
+        terminal.draw(|frame| self.draw(frame))?;
+        self.perform_git_plan(&path);
+        Ok(())
+    }
+
+    /// Plan the cleanup and either ask to confirm it or say there is nothing
+    /// to do. Split from `run_git_plan` so tests can run it without a terminal.
+    fn perform_git_plan(&mut self, path: &Path) {
+        let plan = match git::plan(path, &self.root_path) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.modal = Some(Modal::Notice {
+                    title: "git cleanup failed".to_string(),
+                    lines: vec![
+                        format!("{error:#}"),
+                        String::new(),
+                        "press any key to dismiss".to_string(),
+                    ],
+                    ok: false,
+                });
+                return;
+            }
+        };
+
+        if plan.is_empty() {
+            let mut lines = vec![format!(
+                "no worktrees or branches merged into {} to remove",
+                plan.base_label()
+            )];
+            lines.extend(plan.kept.summary());
+            lines.push(String::new());
+            lines.push("press any key to dismiss".to_string());
+            self.modal = Some(Modal::Notice {
+                title: "nothing to clean".to_string(),
+                lines,
+                ok: true,
+            });
+            return;
+        }
+
+        let sizes = plan
+            .worktrees
+            .iter()
+            .map(|worktree| self.node_at(&worktree.relative).map_or(0, |node| node.size))
+            .collect();
+        self.modal = Some(Modal::Confirm(Confirmation::Git(GitTarget { plan, sizes })));
+    }
+
+    fn run_git_clean(&mut self, terminal: &mut DefaultTerminal, target: GitTarget) -> Result<()> {
+        self.modal = Some(Modal::Notice {
+            title: "git cleanup".to_string(),
+            lines: vec![
+                format!(
+                    "removing unused worktrees and branches in {}",
+                    display_path(&target.plan.repo)
+                ),
+                "this can take a moment".to_string(),
+            ],
+            ok: true,
+        });
+        terminal.draw(|frame| self.draw(frame))?;
+        self.perform_git_clean(target);
+        Ok(())
+    }
+
+    fn perform_git_clean(&mut self, target: GitTarget) {
+        let outcome = git::execute(&target.plan, &self.root_path);
+
+        let mut lines = Vec::new();
+        if !outcome.removed.is_empty() {
+            let freed: u64 = target
+                .plan
+                .worktrees
+                .iter()
+                .zip(&target.sizes)
+                .filter(|(worktree, _)| {
+                    outcome
+                        .removed
+                        .iter()
+                        .any(|removed| removed.path == worktree.path)
+                })
+                .map(|(_, size)| *size)
+                .sum();
+            let mut line = format!(
+                "removed {}",
+                plural(outcome.removed.len() as u64, "worktree", "worktrees")
+            );
+            if freed > 0 {
+                line.push_str(&format!(", about {} freed", bytes(freed)));
+            }
+            lines.push(line);
+        }
+        if outcome.pruned > 0 {
+            lines.push(format!(
+                "pruned {}",
+                plural(
+                    outcome.pruned as u64,
+                    "stale worktree entry",
+                    "stale worktree entries"
+                )
+            ));
+        }
+        if !outcome.deleted.is_empty() {
+            lines.push(format!(
+                "deleted {}",
+                plural(outcome.deleted.len() as u64, "branch", "branches")
+            ));
+        }
+        for failure in outcome.failures.iter().take(3) {
+            lines.push(format!("failed: {failure}"));
+        }
+        if outcome.failures.len() > 3 {
+            lines.push(format!("(+{} more failures)", outcome.failures.len() - 3));
+        }
+        lines.push(String::new());
+        lines.push("press any key to dismiss".to_string());
+
+        let removed: Vec<PathBuf> = outcome
+            .removed
+            .iter()
+            .map(|worktree| self.root_path.join(&worktree.relative))
+            .collect();
+        self.update_after_removal(&removed);
+
+        let ok = outcome.failures.is_empty();
+        self.modal = Some(Modal::Notice {
+            title: if ok {
+                "git cleanup finished"
+            } else {
+                "git cleanup finished with errors"
+            }
+            .to_string(),
+            lines,
+            ok,
+        });
+    }
+
+    /// The scanned node at a path relative to the root, if the scan saw it.
+    fn node_at(&self, relative: &Path) -> Option<&Node> {
+        let mut node = &self.root;
+        for component in relative.components() {
+            let name = component.as_os_str();
+            node = node
+                .children
+                .iter()
+                .find(|child| OsStr::new(&*child.name) == name)?;
+        }
+        Some(node)
+    }
+
     fn run_clean(&mut self, terminal: &mut DefaultTerminal, target: CleanTarget) -> Result<()> {
         self.modal = Some(Modal::Notice {
             title: "cargo clean".to_string(),
@@ -637,7 +834,7 @@ impl App {
         lines.push("press any key to dismiss".to_string());
 
         if ok {
-            self.update_after_removal(&target.path);
+            self.update_after_removal(std::slice::from_ref(&target.path));
         }
         self.modal = Some(Modal::Notice {
             title: title.to_string(),
@@ -646,15 +843,17 @@ impl App {
         });
     }
 
-    /// Drop the subtree at `target` from the in-memory tree, adjusting sizes,
-    /// file counts, and reclaimable totals along the path to it. Only the
+    /// Drop the subtrees at `targets` from the in-memory tree, adjusting sizes,
+    /// file counts, and reclaimable totals along the path to each. Only the
     /// ancestors are visited; the rest of the tree is left untouched.
-    fn update_after_removal(&mut self, target: &Path) {
+    fn update_after_removal(&mut self, targets: &[PathBuf]) {
         let names = self.stack_names();
         let selected = self.selected_node().map(|node| node.name.to_string());
 
-        let mut path = self.root_path.clone();
-        Self::prune_path(&mut self.root, &mut path, target);
+        for target in targets {
+            let mut path = self.root_path.clone();
+            Self::prune_path(&mut self.root, &mut path, target);
+        }
 
         self.restore_navigation(names, selected);
         self.status = None;
@@ -908,6 +1107,8 @@ impl App {
             Span::raw(" cargo clean  "),
             Span::styled("d", Style::new().fg(accent)),
             Span::raw(" delete  "),
+            Span::styled("w", Style::new().fg(accent)),
+            Span::raw(" git cleanup  "),
             Span::styled("t", Style::new().fg(accent)),
             Span::raw(format!(" theme: {}  ", self.theme.label())),
             Span::styled("q", Style::new().fg(accent)),
@@ -997,6 +1198,11 @@ impl App {
                 ];
                 ("confirm delete", Color::Red, plain_lines(lines, text_width))
             }
+            Modal::Confirm(Confirmation::Git(target)) => (
+                "confirm git cleanup",
+                self.theme.tag(),
+                plain_lines(git_confirm_lines(target, text_width), text_width),
+            ),
             Modal::Notice { title, lines, ok } => (
                 title.as_str(),
                 if *ok { Color::Green } else { Color::Red },
@@ -1056,6 +1262,91 @@ fn plain_lines(lines: Vec<String>, width: usize) -> Vec<Line<'static>> {
         .into_iter()
         .map(|line| Line::from(truncate_right(&line, width)))
         .collect()
+}
+
+/// Entries listed per section of the git cleanup confirmation before the rest
+/// are summarized as a count.
+const GIT_LIST_LIMIT: usize = 8;
+
+fn git_confirm_lines(target: &GitTarget, width: usize) -> Vec<String> {
+    let plan = &target.plan;
+    let label = "repository: ";
+    let mut lines = vec![
+        format!(
+            "{label}{}",
+            truncate_left(&display_path(&plan.repo), width.saturating_sub(label.len()))
+        ),
+        format!("merged means reachable from {}", plan.base_label()),
+        String::new(),
+    ];
+
+    if !plan.worktrees.is_empty() {
+        let mut heading = format!(
+            "remove {}",
+            plural(plan.worktrees.len() as u64, "worktree", "worktrees")
+        );
+        if target.estimate() > 0 {
+            heading.push_str(&format!(", about {}", bytes(target.estimate())));
+        }
+        heading.push_str(" (ignored files go too):");
+        lines.push(heading);
+        for (worktree, size) in plan
+            .worktrees
+            .iter()
+            .zip(&target.sizes)
+            .take(GIT_LIST_LIMIT)
+        {
+            // Branch first and the path relative to the scan root, as the
+            // browser shows it, so a long path cannot hide the branch.
+            let branch = worktree.branch.as_deref().unwrap_or("detached");
+            lines.push(format!(
+                "  {}  [{branch}]  {}",
+                right(&bytes(*size), 7),
+                worktree.relative.display()
+            ));
+        }
+        if plan.worktrees.len() > GIT_LIST_LIMIT {
+            lines.push(format!(
+                "  (+{} more)",
+                plan.worktrees.len() - GIT_LIST_LIMIT
+            ));
+        }
+    }
+    if !plan.stale.is_empty() {
+        lines.push(format!(
+            "prune {} (directory already gone)",
+            plural(
+                plan.stale.len() as u64,
+                "stale worktree entry",
+                "stale worktree entries"
+            )
+        ));
+    }
+    if !plan.branches.is_empty() {
+        lines.push(format!(
+            "delete {}:",
+            plural(
+                plan.branches.len() as u64,
+                "merged branch",
+                "merged branches"
+            )
+        ));
+        for branch in plan.branches.iter().take(GIT_LIST_LIMIT) {
+            lines.push(format!("  {}", branch.name));
+        }
+        if plan.branches.len() > GIT_LIST_LIMIT {
+            lines.push(format!(
+                "  (+{} more)",
+                plan.branches.len() - GIT_LIST_LIMIT
+            ));
+        }
+    }
+    if let Some(kept) = plan.kept.summary() {
+        lines.push(kept);
+    }
+    lines.push(String::new());
+    lines.push("y / enter  run     n / esc  cancel".to_string());
+    lines
 }
 
 /// Resolve a path typed in the `go` prompt. Relative paths are joined to the
@@ -1623,6 +1914,105 @@ mod tests {
 
         assert!(fs::symlink_metadata(tmp.path().join("dir/link")).is_err());
         assert!(target.exists(), "the link target must survive");
+    }
+
+    fn screen(app: &mut App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content()
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn w_confirms_then_removes_unused_worktrees_and_branches() {
+        let (_tmp, root, repo) = crate::git::tests::fixture();
+        let result = scan(&root, ScanOptions::default());
+        let mut app = App::new(result.root, &root, ScanOptions::default());
+        select(&mut app, "repo");
+        let before = app.current().size;
+
+        app.handle_key(KeyCode::Char('w'));
+        let Some(Action::PlanGit(path)) = app.pending.take() else {
+            panic!("planning queued");
+        };
+        assert_eq!(path, repo);
+        app.perform_git_plan(&path);
+
+        let Some(Modal::Confirm(Confirmation::Git(target))) = &app.modal else {
+            panic!("expected a confirmation modal");
+        };
+        assert_eq!(target.plan.worktrees.len(), 1);
+        assert!(target.estimate() >= 64 * 1024, "sized from the scan");
+        let shown = screen(&mut app);
+        assert!(shown.contains("confirm git cleanup"), "{shown}");
+        assert!(shown.contains("[feat-merged]"), "{shown}");
+        assert!(shown.contains("feat-stale"), "{shown}");
+        assert!(shown.contains("1 worktree with changes"), "{shown}");
+        assert!(
+            repo.join(".wt/merged").exists(),
+            "planning must not delete anything"
+        );
+
+        app.handle_key(KeyCode::Char('y'));
+        let Some(Action::Confirm(Confirmation::Git(target))) = app.pending.take() else {
+            panic!("cleanup queued");
+        };
+        app.perform_git_clean(target);
+
+        let Some(Modal::Notice { title, ok, lines }) = &app.modal else {
+            panic!("expected a result notice");
+        };
+        assert!(ok, "{lines:?}");
+        assert_eq!(title, "git cleanup finished");
+        assert!(
+            lines[0].starts_with("removed 1 worktree, about "),
+            "{lines:?}"
+        );
+        assert!(!repo.join(".wt/merged").exists());
+        assert!(
+            app.node_at(Path::new("repo/.wt/merged")).is_none(),
+            "the removed worktree leaves the tree"
+        );
+        assert!(app.node_at(Path::new("repo/.wt/dirty")).is_some());
+        assert!(app.current().size < before);
+    }
+
+    #[test]
+    fn w_outside_a_git_checkout_explains_why() {
+        let (tmp, result) = tree();
+        let mut app = App::new(result.root, tmp.path(), ScanOptions::default());
+        app.handle_key(KeyCode::Char('w'));
+        assert!(app.pending.is_none());
+        assert!(app.modal.is_none());
+        assert!(app.status.as_deref().is_some_and(|s| s.contains("git")));
+    }
+
+    #[test]
+    fn w_with_nothing_unused_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        crate::git::tests::run(&repo, &["init", "-q", "-b", "main"]);
+        crate::git::tests::commit(&repo, "readme", "one");
+
+        let result = scan(tmp.path(), ScanOptions::default());
+        let mut app = App::new(result.root, tmp.path(), ScanOptions::default());
+        select(&mut app, "repo");
+        app.handle_key(KeyCode::Char('w'));
+        let Some(Action::PlanGit(path)) = app.pending.take() else {
+            panic!("planning queued");
+        };
+        app.perform_git_plan(&path);
+        let Some(Modal::Notice { title, .. }) = &app.modal else {
+            panic!("expected a notice");
+        };
+        assert_eq!(title, "nothing to clean");
     }
 
     #[test]

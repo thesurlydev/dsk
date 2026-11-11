@@ -3,6 +3,7 @@ mod clean;
 mod cli;
 mod color;
 mod format;
+mod git;
 mod report;
 mod scan;
 mod tui;

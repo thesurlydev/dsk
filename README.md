@@ -89,6 +89,7 @@ Plain `dsk` (or `dsk tui`) opens a drill-down browser with the same tree and art
 | `t` | toggle the light/dark color theme |
 | `c` | run `cargo clean` for the selected Cargo project or target (asks first) |
 | `d` | delete the selected file or directory (asks first) |
+| `w` | remove unused worktrees and branches of the selected git checkout (asks first) |
 | `q` / escape | quit |
 
 The footer shows the selected path, its share of the current directory, and the
@@ -104,6 +105,26 @@ Pressing `d` opens the same kind of confirmation for whatever is selected, file
 or directory, and deletes it once confirmed. Symlinks are unlinked, never
 followed, and the entry is re-checked immediately before deletion so it must
 still exist and resolve inside the scan root.
+
+Pressing `w` on a git checkout (a directory with `.git`, main or linked
+worktree) lists what is unused and asks before removing it. "Merged" means
+reachable from the default branch, taken as both the local branch and its
+`origin` counterpart (from `origin/HEAD`, else `main` or `master`), so a branch
+merged on the remote counts even when the local default branch lags. Nothing
+removed can take a commit with it:
+
+- a linked worktree is removed when its HEAD is merged, it has no modified or
+  untracked files, it is not locked, and it lies inside the scan root. Its
+  ignored files, such as `target/`, go with it, which is usually where the space is;
+- stale worktree entries whose directories are already gone are pruned;
+- a local branch is deleted when it is merged and no remaining worktree has it
+  checked out. The default branch is never deleted.
+
+The confirmation shows each worktree with its size and branch, the branches,
+and a count of what was kept and why. Each worktree and branch is re-checked
+right before removal (HEAD unchanged, still merged), and git itself still
+refuses a worktree with changes. dsk does not fetch, so it judges against the
+remote-tracking refs as of your last fetch.
 
 Pressing `g` opens a path prompt. The path may be absolute or relative to the
 directory currently on screen, and a leading `~` expands to your home

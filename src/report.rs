@@ -115,10 +115,21 @@ fn render_top_level(out: &mut String, root: &Node, options: &ReportOptions, pain
             bar(node.size, total, BAR_WIDTH),
             paint.cyan(&label),
         );
+        let mut notes = Vec::new();
         if node.reclaimable > 0 {
+            notes.push(format!("{} cleanable", bytes(node.reclaimable)));
+        }
+        if node.target_bytes > 0 || node.worktree_bytes > 0 {
+            notes.push(format!(
+                "target {}, worktree {}",
+                bytes(node.target_bytes),
+                bytes(node.worktree_bytes)
+            ));
+        }
+        if !notes.is_empty() {
             line.push_str(&format!(
                 "  {}",
-                paint.dim(&format!("({} cleanable)", bytes(node.reclaimable)))
+                paint.dim(&format!("({})", notes.join("; ")))
             ));
         }
         out.push_str(&line);
@@ -425,6 +436,10 @@ struct JsonEntry {
     bytes: u64,
     share_percent: f64,
     reclaimable_bytes: u64,
+    /// Bytes in Cargo `target/` directories.
+    target_bytes: u64,
+    /// Bytes in linked git worktrees outside their `target/` directories.
+    worktree_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -478,6 +493,8 @@ pub fn json(
             bytes: node.size,
             share_percent: share(node.size, total),
             reclaimable_bytes: node.reclaimable,
+            target_bytes: node.target_bytes,
+            worktree_bytes: node.worktree_bytes,
         })
         .collect();
 
@@ -604,6 +621,10 @@ mod tests {
             value["artifacts"]["total_bytes"].as_u64().unwrap(),
             result.root.reclaimable
         );
+        let project = &value["top_level"][0];
+        assert_eq!(project["name"], "project");
+        assert!(project["target_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(project["worktree_bytes"], 0);
         assert!(
             value["artifacts"]["candidates"][0]["command"]
                 .as_str()

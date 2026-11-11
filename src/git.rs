@@ -30,6 +30,26 @@ pub fn is_checkout(path: &Path) -> bool {
     fs::symlink_metadata(path.join(".git")).is_ok()
 }
 
+/// Whether `path` is the top of a linked worktree: its `.git` is a file whose
+/// `gitdir:` points into a repository's `worktrees/` directory. Submodules
+/// also use a `.git` file, but theirs points into `modules/`.
+pub fn is_linked_worktree(path: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(path.join(".git")) else {
+        return false;
+    };
+    let Some(gitdir) = contents
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("gitdir:"))
+    else {
+        return false;
+    };
+    Path::new(gitdir.trim())
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "worktrees")
+}
+
 /// What a cleanup would remove, computed before asking for confirmation.
 #[derive(Debug)]
 pub struct Plan {

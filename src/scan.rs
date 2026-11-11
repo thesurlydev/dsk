@@ -43,6 +43,15 @@ pub struct Node {
     pub artifact: Option<ArtifactKind>,
     /// Index into `ScanResult::artifacts` for a generated directory.
     pub artifact_id: Option<u32>,
+    /// Bytes in Cargo `target/` directories in the subtree, including this
+    /// directory when it is one.
+    pub target_bytes: u64,
+    /// Bytes in linked git worktrees in the subtree that are not already in
+    /// `target_bytes`, so the two never overlap and together never exceed
+    /// `size`.
+    pub worktree_bytes: u64,
+    /// Set when this directory is the top of a linked git worktree.
+    pub worktree: bool,
     /// The `(device, inode)` key of a regular file with more than one link.
     pub hardlink: Option<(u64, u64)>,
     /// True when another path owns this hard-linked file's blocks. The node's
@@ -62,6 +71,9 @@ impl Node {
             reclaimable: 0,
             artifact: None,
             artifact_id: None,
+            target_bytes: 0,
+            worktree_bytes: 0,
+            worktree: false,
             hardlink: None,
             shared: false,
             children: Box::new([]),
@@ -70,6 +82,22 @@ impl Node {
 
     pub fn is_dir(&self) -> bool {
         self.kind == NodeKind::Dir
+    }
+
+    /// Recompute `target_bytes` and `worktree_bytes` from the children and
+    /// this directory's own role. Callers must have settled `size` and the
+    /// children's figures first.
+    pub fn roll_up_split(&mut self) {
+        self.target_bytes = if self.artifact == Some(ArtifactKind::RustTarget) {
+            self.size
+        } else {
+            self.children.iter().map(|child| child.target_bytes).sum()
+        };
+        self.worktree_bytes = if self.worktree {
+            self.size.saturating_sub(self.target_bytes)
+        } else {
+            self.children.iter().map(|child| child.worktree_bytes).sum()
+        };
     }
 }
 
@@ -200,12 +228,14 @@ impl Scanner {
             Err(error) => {
                 self.record_error(path, &error);
                 self.record_artifact(path, &mut node);
+                node.roll_up_split();
                 return node;
             }
         };
 
         let mut dirs: Vec<(std::path::PathBuf, Box<str>, Metadata)> = Vec::new();
         let mut files: Vec<(Box<str>, Metadata)> = Vec::new();
+        let mut git_file = false;
         for entry in read_dir {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -227,6 +257,7 @@ impl Scanner {
                 }
                 Ok(child) => {
                     let child_name = entry.file_name().to_string_lossy().into_owned();
+                    git_file |= child_name == ".git" && child.is_file();
                     files.push((child_name.into(), child));
                 }
                 Err(error) => self.record_error(&child_path, &error),
@@ -257,6 +288,9 @@ impl Scanner {
                     reclaimable: 0,
                     artifact: None,
                     artifact_id: None,
+                    target_bytes: 0,
+                    worktree_bytes: 0,
+                    worktree: false,
                     hardlink: inode_key(&metadata),
                     shared: false,
                     children: Box::new([]),
@@ -283,6 +317,10 @@ impl Scanner {
         self.record_artifact(path, &mut node);
 
         node.children = children.into_boxed_slice();
+        // Only a `.git` file marks a linked worktree; the main checkout has a
+        // `.git` directory.
+        node.worktree = git_file && crate::git::is_linked_worktree(path);
+        node.roll_up_split();
         node
     }
 
@@ -371,6 +409,7 @@ fn dedup_node(
     } else {
         node.reclaimable = node.children.iter().map(|child| child.reclaimable).sum();
     }
+    node.roll_up_split();
 
     node.children
         .sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
@@ -603,6 +642,63 @@ mod tests {
             .iter()
             .find(|child| child.name.as_ref() == name)
             .unwrap_or_else(|| panic!("{name} is not a child of {}", node.name))
+    }
+
+    #[test]
+    fn splits_cargo_targets_from_the_rest_of_linked_worktrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let worktree = repo.join("wt/feature");
+        let submodule = repo.join("vendor/sub");
+        fs::create_dir_all(repo.join("target")).unwrap();
+        fs::create_dir_all(worktree.join("target")).unwrap();
+        fs::create_dir_all(&submodule).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        for dir in [&repo, &worktree] {
+            fs::write(dir.join("Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+        }
+        fs::write(repo.join("target/blob"), vec![0u8; 256 * 1024]).unwrap();
+        fs::write(worktree.join("target/blob"), vec![0u8; 128 * 1024]).unwrap();
+        fs::write(worktree.join("src.rs"), vec![b'x'; 64 * 1024]).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                repo.join(".git/worktrees/feature").display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            submodule.join(".git"),
+            format!("gitdir: {}\n", repo.join(".git/modules/sub").display()),
+        )
+        .unwrap();
+        fs::write(submodule.join("data"), vec![0u8; 64 * 1024]).unwrap();
+
+        let result = scan(tmp.path(), options());
+        let repo_node = child(&result.root, "repo");
+        let worktree_node = child(child(repo_node, "wt"), "feature");
+        let submodule_node = child(child(repo_node, "vendor"), "sub");
+        let main_target = child(repo_node, "target");
+        let worktree_target = child(worktree_node, "target");
+
+        assert!(worktree_node.worktree);
+        assert!(!submodule_node.worktree, "a submodule is not a worktree");
+        assert!(!repo_node.worktree, "the main checkout is not a worktree");
+        assert_eq!(submodule_node.worktree_bytes, 0);
+
+        assert_eq!(worktree_node.target_bytes, worktree_target.size);
+        assert_eq!(
+            worktree_node.worktree_bytes,
+            worktree_node.size - worktree_target.size
+        );
+        assert_eq!(
+            repo_node.target_bytes,
+            main_target.size + worktree_target.size
+        );
+        assert_eq!(repo_node.worktree_bytes, worktree_node.worktree_bytes);
+        assert_eq!(result.root.target_bytes, repo_node.target_bytes);
+        assert!(repo_node.target_bytes + repo_node.worktree_bytes <= repo_node.size);
     }
 
     #[test]

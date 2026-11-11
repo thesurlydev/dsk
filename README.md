@@ -103,6 +103,16 @@ which is why it can read slightly higher than `df`'s `Used` column. Free space i
 what a non-root process can still allocate, which is `df`'s `Avail` column. The
 bar drops out on narrow terminals so the free figure stays visible.
 
+The `target` and `worktree` columns split each row's size into Cargo `target/`
+directories and linked git worktrees, and the header shows the same split for
+the directory being viewed. The two never overlap: a `target/` inside a worktree
+counts under `target`, and `worktree` is the rest of the worktree, mostly
+sources and other checked-out files. A linked worktree is a directory whose
+`.git` is a file pointing into a repository's `worktrees/` directory, so the
+main checkout and submodules are not counted; its row carries a `[wt]` tag.
+`dsk report` adds the same split to each top-level entry, and `--json` reports
+it as `target_bytes` and `worktree_bytes`.
+
 The footer shows the selected path, its share of the current directory, and the
 command that would reclaim it. A row whose blocks are counted under another
 path shows `0B` and a `[link]` tag; selecting it explains that in the footer.

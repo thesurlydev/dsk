@@ -84,6 +84,7 @@ Plain `dsk` (or `dsk tui`) opens a drill-down browser with the same tree and art
 | `backspace` / `h` / left | go up |
 | `home`, `end` / `G` | jump to start / end |
 | `g` | go to a directory by path |
+| `r` | rescan the current root to pick up changes made outside dsk |
 | `s` | cycle sort: size, file count, name |
 | `f` | show or hide files (directories only) |
 | `t` | toggle the light/dark color theme |

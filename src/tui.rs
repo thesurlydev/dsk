@@ -44,7 +44,8 @@ struct App {
     sort: SortKey,
     show_files: bool,
     theme: Theme,
-    /// Scan settings used when the user opens a different directory with `g`.
+    /// Scan settings used when the user opens a different directory with `g`
+    /// or rescans with `r`.
     scan: ScanOptions,
     /// Capacity of the filesystem holding the directory being viewed. Refreshed
     /// with the directory listing so it follows navigations.
@@ -77,6 +78,8 @@ enum Confirmation {
 enum Action {
     Confirm(Confirmation),
     Go(String),
+    /// Scan the current root again, keeping the place in the tree.
+    Rescan,
     /// Work out which worktrees and branches of this checkout are unused.
     PlanGit(PathBuf),
 }
@@ -288,6 +291,7 @@ impl App {
                     self.run_git_clean(terminal, target)?
                 }
                 Some(Action::Go(input)) => self.run_go(terminal, input)?,
+                Some(Action::Rescan) => self.run_rescan(terminal)?,
                 Some(Action::PlanGit(path)) => self.run_git_plan(terminal, path)?,
                 None => {}
             }
@@ -428,6 +432,7 @@ impl App {
             }
             KeyCode::Char('t') => self.theme.toggle(),
             KeyCode::Char('g') => self.request_go(),
+            KeyCode::Char('r') => self.pending = Some(Action::Rescan),
             KeyCode::Char('c') => self.request_clean(),
             KeyCode::Char('d') => self.request_delete(),
             KeyCode::Char('w') => self.request_git_clean(),
@@ -549,6 +554,40 @@ impl App {
         self.selected = 0;
         self.state = TableState::default();
         self.refresh();
+        self.status = (errors > 0).then(|| {
+            format!(
+                "{} could not be read; totals exclude them",
+                plural(errors, "path", "paths")
+            )
+        });
+        self.modal = None;
+    }
+
+    fn run_rescan(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        self.modal = Some(Modal::Notice {
+            title: "rescan".to_string(),
+            lines: vec![
+                format!("scanning {}", display_path(&self.root_path)),
+                "this can take a moment".to_string(),
+            ],
+            ok: true,
+        });
+        terminal.draw(|frame| self.draw(frame))?;
+        self.perform_rescan();
+        Ok(())
+    }
+
+    /// Scan the root again to pick up changes made outside dsk, then return to
+    /// the same directory and selection by name. If the directory being viewed
+    /// is gone, the view moves to its nearest surviving ancestor.
+    fn perform_rescan(&mut self) {
+        let names = self.stack_names();
+        let selected = self.selected_node().map(|node| node.name.to_string());
+
+        let result = crate::scan::scan(&self.root_path, self.scan);
+        let errors = result.stats.errors;
+        self.root = result.root;
+        self.restore_navigation(names, selected);
         self.status = (errors > 0).then(|| {
             format!(
                 "{} could not be read; totals exclude them",
@@ -1189,6 +1228,8 @@ impl App {
             Span::raw(" open  "),
             Span::styled("g", Style::new().fg(accent)),
             Span::raw(" go  "),
+            Span::styled("r", Style::new().fg(accent)),
+            Span::raw(" rescan  "),
             Span::styled("backspace/h", Style::new().fg(accent)),
             Span::raw(" up  "),
             Span::styled("s", Style::new().fg(accent)),
@@ -1804,6 +1845,68 @@ mod tests {
         assert_eq!(app.selected, 0);
         assert!(app.modal.is_none());
         assert_eq!(app.current().children[app.order[0]].name.as_ref(), "blob");
+    }
+
+    #[test]
+    fn r_rescans_and_keeps_the_place_in_the_tree() {
+        let (tmp, result) = tree();
+        let mut app = App::new(result.root, tmp.path(), ScanOptions::default());
+        app.handle_key(KeyCode::Enter);
+        select(&mut app, "main.rs");
+        let before = app.root.size;
+
+        // Changes made behind dsk's back: a new large file and a new directory.
+        let project = tmp.path().join("project");
+        fs::write(project.join("big"), vec![0u8; 512 * 1024]).unwrap();
+        fs::create_dir_all(tmp.path().join("other")).unwrap();
+
+        app.handle_key(KeyCode::Char('r'));
+        assert!(
+            matches!(app.pending, Some(Action::Rescan)),
+            "rescan is queued so the loop can show progress first"
+        );
+        assert_eq!(app.root.size, before, "queueing alone does not rescan");
+        app.pending = None;
+        app.perform_rescan();
+
+        assert!(app.modal.is_none());
+        assert!(app.root.size > before, "the new file is counted");
+        assert_eq!(app.current_path(), project, "still inside project/");
+        assert_eq!(
+            app.selected_node()
+                .map(|node| node.name.to_string())
+                .as_deref(),
+            Some("main.rs"),
+            "selection follows the entry by name, not by index"
+        );
+        assert!(
+            app.current()
+                .children
+                .iter()
+                .any(|node| node.name.as_ref() == "big"),
+            "new entries appear in the listing"
+        );
+        assert_eq!(app.root.children.len(), 2, "new top-level directory found");
+    }
+
+    #[test]
+    fn rescan_moves_up_when_the_viewed_directory_is_gone() {
+        let (tmp, result) = tree();
+        let mut app = App::new(result.root, tmp.path(), ScanOptions::default());
+        app.handle_key(KeyCode::Enter);
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.current_path(), tmp.path().join("project/target"));
+
+        fs::remove_dir_all(tmp.path().join("project/target")).unwrap();
+        app.perform_rescan();
+
+        assert_eq!(app.current_path(), tmp.path().join("project"));
+        assert!(
+            app.current()
+                .children
+                .iter()
+                .all(|node| node.name.as_ref() != "target")
+        );
     }
 
     #[test]

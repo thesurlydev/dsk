@@ -97,12 +97,21 @@ The header has two lines. The first is the size, file and directory counts, and
 reclaimable space of the directory being viewed. The second is the capacity of
 the filesystem that directory lives on: how much is in use, a usage bar, and how
 much is still free. It follows the filesystem as you navigate, so scanning one
-project never hides how full the disk is, and it is re-read after a clean or
-delete. Used space is the filesystem total minus the free blocks, so used plus
+project never hides how full the disk is, and it is re-read every second, so
+space freed by a clean or delete, or used by a build elsewhere, shows up without
+a keypress. Used space is the filesystem total minus the free blocks, so used plus
 free is the total; that counts filesystem metadata and reserved space as used,
 which is why it can read slightly higher than `df`'s `Used` column. Free space is
 what a non-root process can still allocate, which is `df`'s `Avail` column. The
 bar drops out on narrow terminals so the free figure stays visible.
+
+The `private` column is what deleting each row would free: its size minus blocks
+it shares with APFS clones elsewhere (see [How sizes are measured](#how-sizes-are-measured)).
+It reads dim where nothing is shared. Where they differ, the header shows the
+private figure for the directory being viewed, the footer says how much of the
+selection is shared, and the `c`, `d`, and `w` confirmations say how much would
+be freed and how much stays. A worktree whose `target/` was seeded with
+`cp -c` from the main checkout can hold far more than it would free.
 
 The `target` and `worktree` columns split each row's size into Cargo `target/`
 directories and linked git worktrees, and the header shows the same split for
@@ -189,8 +198,19 @@ directory are counted once, as part of the outer directory.
 ## How sizes are measured
 
 - Allocated blocks (`st_blocks * 512`), the same metric as `du` and `df`. This
-  matters on APFS, where sparse files and clonefile copies would otherwise
-  inflate totals. Totals match `du -sk` byte for byte on the trees tested.
+  matters on APFS, where sparse files would otherwise inflate totals. Totals
+  match `du -sk` byte for byte on the trees tested.
+- APFS clones (`cp -c`, `clonefile`) share blocks until one side is written,
+  and `st_blocks` counts the shared blocks in every copy, as `du` does. So on
+  macOS dsk also reads each file's private size (`ATTR_CMNEXT_PRIVATESIZE`,
+  one `getattrlistbulk` listing per directory): the blocks no other file
+  shares, which is what deleting it frees. Reclaimable figures, the clean and
+  delete estimates, and `dsk clean`'s totals and `--min-size` use private
+  bytes; sizes and shares stay allocated bytes. `--json` reports both, as
+  `bytes` and `private_bytes`. Blocks two clones share count as private to
+  neither, so deleting a directory that holds both sides frees more than its
+  private figure says; the figure never promises more than a delete frees.
+  Other filesystems, and other platforms, count every allocated byte as private.
 - Symlinks are measured and never followed, so there are no cycles and no
   double counting through links.
 - Hard-linked files are counted once per `(device, inode)` pair, like `du`.

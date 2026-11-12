@@ -644,7 +644,10 @@ impl App {
         let result = crate::scan::scan(&self.root_path, self.scan);
         let errors = result.stats.errors;
         self.root = result.root;
-        self.restore_navigation(names, selected);
+        self.restore_navigation(names);
+        if let Some(name) = selected {
+            self.select_by_name(&name);
+        }
         self.status = (errors > 0).then(|| {
             format!(
                 "{} could not be read; totals exclude them",
@@ -966,16 +969,20 @@ impl App {
     /// Drop the subtrees at `targets` from the in-memory tree, adjusting sizes,
     /// file counts, and reclaimable totals along the path to each. Only the
     /// ancestors are visited; the rest of the tree is left untouched.
+    ///
+    /// The highlight returns to the top row: the selected row is usually one of
+    /// those removed, and every row below it has shifted up, so keeping the old
+    /// position would land on an unrelated entry.
     fn update_after_removal(&mut self, targets: &[PathBuf]) {
         let names = self.stack_names();
-        let selected = self.selected_node().map(|node| node.name.to_string());
 
         for target in targets {
             let mut path = self.root_path.clone();
             Self::prune_path(&mut self.root, &mut path, target);
         }
 
-        self.restore_navigation(names, selected);
+        self.restore_navigation(names);
+        self.select_top();
         self.status = None;
     }
 
@@ -1002,15 +1009,16 @@ impl App {
 
     /// Drop cargo target subtrees that no longer exist on disk, without
     /// rescanning. Sizes, file counts, and reclaimable totals are adjusted
-    /// along the path to each removed directory.
+    /// along the path to each removed directory. As after a delete, the
+    /// highlight returns to the top row.
     fn update_after_clean(&mut self) {
         let names = self.stack_names();
-        let selected = self.selected_node().map(|node| node.name.to_string());
 
         let mut path = self.root_path.clone();
         Self::prune_node(&mut self.root, &mut path);
 
-        self.restore_navigation(names, selected);
+        self.restore_navigation(names);
+        self.select_top();
         self.status = None;
     }
 
@@ -1046,8 +1054,9 @@ impl App {
 
     /// Rebuild the navigation stack by name after child indices may have
     /// shifted. Stops at the nearest ancestor that still exists, which moves
-    /// the view out of a directory that was just deleted.
-    fn restore_navigation(&mut self, names: Vec<String>, selected: Option<String>) {
+    /// the view out of a directory that was just deleted. The selection is
+    /// left to the caller.
+    fn restore_navigation(&mut self, names: Vec<String>) {
         let mut indices = Vec::with_capacity(names.len());
         {
             let mut node = &self.root;
@@ -1065,11 +1074,19 @@ impl App {
         }
         self.stack = indices;
         self.refresh();
-        if let Some(name) = selected
-            && let Some(position) = self
-                .order
-                .iter()
-                .position(|index| self.current().children[*index].name.as_ref() == name.as_str())
+    }
+
+    fn select_top(&mut self) {
+        self.selected = 0;
+    }
+
+    /// Move the highlight back to a row by name, keeping the current position
+    /// if that row is gone.
+    fn select_by_name(&mut self, name: &str) {
+        if let Some(position) = self
+            .order
+            .iter()
+            .position(|index| self.current().children[*index].name.as_ref() == name)
         {
             self.selected = position;
         }
@@ -2146,6 +2163,7 @@ mod tests {
         app.update_after_clean();
 
         assert_eq!(app.stack.len(), 1, "still viewing the project");
+        assert_eq!(app.selected, 0, "the highlight returns to the top row");
         assert!(
             app.current()
                 .children
@@ -2198,12 +2216,39 @@ mod tests {
 
         app.perform_delete(target);
         assert!(!file.exists());
+        assert_eq!(app.selected, 0, "the highlight returns to the top row");
         assert!(
             app.current()
                 .children
                 .iter()
                 .all(|child| child.name.as_ref() != "main.rs")
         );
+    }
+
+    #[test]
+    fn deleting_a_middle_row_moves_the_highlight_to_the_top() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dir");
+        fs::create_dir_all(&dir).unwrap();
+        for (name, size) in [("a", 96 * 1024), ("b", 64 * 1024), ("c", 32 * 1024)] {
+            fs::write(dir.join(name), vec![0u8; size]).unwrap();
+        }
+
+        let result = scan(tmp.path(), ScanOptions::default());
+        let mut app = App::new(result.root, tmp.path(), ScanOptions::default());
+        app.handle_key(KeyCode::Enter);
+        select(&mut app, "b");
+        assert_eq!(app.selected, 1, "b sits between a and c by size");
+
+        app.handle_key(KeyCode::Char('d'));
+        let Some(Modal::Confirm(Confirmation::Delete(target))) = app.modal.take() else {
+            panic!("expected a confirmation modal");
+        };
+        app.perform_delete(target);
+
+        assert!(!dir.join("b").exists());
+        assert_eq!(app.selected, 0, "the highlight returns to the top row");
+        assert_eq!(app.selected_node().unwrap().name.as_ref(), "a");
     }
 
     #[test]
@@ -2222,6 +2267,7 @@ mod tests {
         app.perform_delete(target);
 
         assert!(!tmp.path().join("project/target").exists());
+        assert_eq!(app.selected, 0, "the highlight returns to the top row");
         assert!(
             app.current()
                 .children

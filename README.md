@@ -132,12 +132,14 @@ The TUI starts in the dark palette; press `t` at any time to switch to the light
 palette, and the footer shows which is active.
 Pressing `c` on a directory that contains a `Cargo.toml`, or on a detected Cargo
 `target/` directory, opens a confirmation modal; confirming runs
-`cargo clean --manifest-path ...` and updates the tree in place.
+`cargo clean --manifest-path ...` and updates the tree in place. Afterwards the
+highlight returns to the top row, since the rows below shift up.
 
 Pressing `d` opens the same kind of confirmation for whatever is selected, file
 or directory, and deletes it once confirmed. Symlinks are unlinked, never
 followed, and the entry is re-checked immediately before deletion so it must
-still exist and resolve inside the scan root.
+still exist and resolve inside the scan root. As after a clean, the highlight
+returns to the top row.
 
 Pressing `w` on a git checkout (a directory with `.git`, main or linked
 worktree) lists what is unused and asks before removing it. "Merged" means

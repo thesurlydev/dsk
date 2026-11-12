@@ -1,11 +1,11 @@
 mod artifact;
 mod clean;
 mod cli;
-mod clone;
 mod color;
 mod disk;
 mod format;
 mod git;
+mod listing;
 mod report;
 mod scan;
 mod tui;
@@ -87,10 +87,10 @@ fn resolve(path: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn setup_threads(threads: Option<usize>) -> Result<()> {
-    if let Some(threads) = threads {
-        if threads == 0 {
-            bail!("--threads must be at least 1");
-        }
+    if threads == Some(0) {
+        bail!("--threads must be at least 1");
+    }
+    if let Some(threads) = threads.or_else(scan::default_threads) {
         // A pool can only be installed once per process; ignore a second call.
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)

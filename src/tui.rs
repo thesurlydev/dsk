@@ -2245,7 +2245,7 @@ mod tests {
         fs::create_dir_all(main.join("target")).unwrap();
         fs::write(main.join("target/blob"), vec![7u8; 2 * 1024 * 1024]).unwrap();
         fs::create_dir_all(&worktree).unwrap();
-        assert!(crate::clone::tests::cloned(
+        assert!(crate::listing::tests::cloned(
             &main.join("target"),
             &worktree.join("target")
         ));

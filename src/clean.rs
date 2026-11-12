@@ -34,8 +34,7 @@ pub fn run(result: &ScanResult, root: &Path, args: &CleanArgs) -> Result<u8> {
         .filter(|artifact| kinds.contains(&artifact.kind))
         .filter(|artifact| artifact.private >= args.min_size.unwrap_or(0))
         .collect();
-    candidates
-        .sort_unstable_by_key(|artifact| std::cmp::Reverse((artifact.private, artifact.size)));
+    candidates.sort_by_key(|artifact| std::cmp::Reverse((artifact.private, artifact.size)));
 
     println!("dsk clean: {}", root.display());
     if candidates.is_empty() {

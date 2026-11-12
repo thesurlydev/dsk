@@ -373,7 +373,7 @@ fn sort_nodes(nodes: &mut [&Node], sort: SortKey) {
 /// Artifact directories by the space deleting each would free, largest first.
 fn largest_first(artifacts: &[ArtifactDir]) -> Vec<&ArtifactDir> {
     let mut sorted: Vec<&ArtifactDir> = artifacts.iter().collect();
-    sorted.sort_unstable_by_key(|artifact| std::cmp::Reverse((artifact.private, artifact.size)));
+    sorted.sort_by_key(|artifact| std::cmp::Reverse((artifact.private, artifact.size)));
     sorted
 }
 

@@ -305,3 +305,110 @@ fn threads_zero_is_rejected() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("at least 1"));
 }
+
+/// Detaches a disk image when the test ends, however it ends.
+#[cfg(target_os = "macos")]
+struct Mounted(std::path::PathBuf);
+
+#[cfg(target_os = "macos")]
+impl Drop for Mounted {
+    fn drop(&mut self) {
+        let _ = Command::new("hdiutil")
+            .args(["detach", "-quiet", "-force"])
+            .arg(&self.0)
+            .status();
+    }
+}
+
+/// A directory listing describes what lies under a mount, not the mounted
+/// volume, so a mount point needs its own lookup to be counted or skipped.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_mounted_volume_is_scanned_unless_one_file_system_is_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let volume = root.join("volume");
+    fs::create_dir_all(&volume).unwrap();
+    fs::write(root.join("plain"), vec![1u8; 256 * 1024]).unwrap();
+    fs::write(volume.join("covered"), vec![2u8; 128 * 1024]).unwrap();
+
+    let image = tmp.path().join("image.dmg");
+    let hdiutil = |args: &[&str], path: &Path| {
+        Command::new("hdiutil")
+            .args(args)
+            .arg(path)
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    if !hdiutil(
+        &[
+            "create", "-quiet", "-size", "40m", "-fs", "APFS", "-volname", "dsktest",
+        ],
+        &image,
+    ) || !hdiutil(
+        &[
+            "attach",
+            "-quiet",
+            "-nobrowse",
+            "-mountpoint",
+            volume.to_str().unwrap(),
+        ],
+        &image,
+    ) {
+        return; // disk images cannot be made or mounted here
+    }
+    let _mounted = Mounted(volume.clone());
+    fs::write(volume.join("on-volume"), vec![3u8; 1024 * 1024]).unwrap();
+
+    let scan = |extra: &[&str]| -> serde_json::Value {
+        let mut args = vec!["report", "--json", "--all", "-q"];
+        args.extend_from_slice(extra);
+        args.push(root.to_str().unwrap());
+        serde_json::from_str(&stdout(&dsk(&args))).unwrap()
+    };
+    let names = |value: &serde_json::Value| -> Vec<String> {
+        let mut names: Vec<String> = value["top_level"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let across = scan(&[]);
+    assert_eq!(names(&across), ["plain", "volume"]);
+    assert_eq!(across["files"], 2, "the file under the mount is hidden");
+    let on_volume = fs::metadata(volume.join("on-volume")).unwrap().blocks() * 512;
+    let plain = fs::metadata(root.join("plain")).unwrap().blocks() * 512;
+    assert!(across["total_bytes"].as_u64().unwrap() >= on_volume + plain);
+
+    let within = scan(&["--one-file-system"]);
+    assert_eq!(names(&within), ["plain"]);
+    assert_eq!(within["files"], 1);
+    assert_eq!(within["total_bytes"].as_u64().unwrap(), plain);
+}
+
+#[test]
+fn an_unreadable_directory_is_reported_and_the_rest_is_counted() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let locked = tmp.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::write(locked.join("secret"), vec![1u8; 64 * 1024]).unwrap();
+    fs::write(tmp.path().join("open"), vec![2u8; 64 * 1024]).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = dsk(&["report", "--json", "--all", tmp.path().to_str().unwrap()]);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    if fs::read_dir(&locked).is_ok() && stderr(&output).is_empty() {
+        return; // running as root, which can read anything
+    }
+
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(value["errors"], 1);
+    assert_eq!(value["files"], 1, "only the readable file is counted");
+    assert_eq!(value["dirs"], 1, "the directory itself is still listed");
+    assert!(stderr(&output).contains("locked"), "{}", stderr(&output));
+}

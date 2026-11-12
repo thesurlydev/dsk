@@ -71,7 +71,9 @@ Useful `dsk report` flags:
 - `--sort size|count|name` orders listings.
 - `--json` emits a machine-readable report, including the exact clean commands.
 - `-x` / `--one-file-system` stays on one filesystem.
-- `-t N` / `--threads N` sets scan parallelism.
+- `-t N` / `--threads N` sets scan parallelism. The default is one thread per
+  core, capped at 8 on macOS, where more threads contend inside the kernel and
+  scan slower.
 
 ### TUI
 
@@ -201,16 +203,18 @@ directory are counted once, as part of the outer directory.
   matters on APFS, where sparse files would otherwise inflate totals. Totals
   match `du -sk` byte for byte on the trees tested.
 - APFS clones (`cp -c`, `clonefile`) share blocks until one side is written,
-  and `st_blocks` counts the shared blocks in every copy, as `du` does. So on
-  macOS dsk also reads each file's private size (`ATTR_CMNEXT_PRIVATESIZE`,
-  one `getattrlistbulk` listing per directory): the blocks no other file
-  shares, which is what deleting it frees. Reclaimable figures, the clean and
-  delete estimates, and `dsk clean`'s totals and `--min-size` use private
-  bytes; sizes and shares stay allocated bytes. `--json` reports both, as
-  `bytes` and `private_bytes`. Blocks two clones share count as private to
-  neither, so deleting a directory that holds both sides frees more than its
-  private figure says; the figure never promises more than a delete frees.
-  Other filesystems, and other platforms, count every allocated byte as private.
+  and the allocation counts the shared blocks in every copy, as `du` does. So
+  on macOS dsk also works out each file's private bytes: the blocks no other
+  file shares, which is what deleting it frees. The directory listing flags
+  files that share none or all of their blocks; the rare file that shares only
+  some is asked for its private size (`ATTR_CMNEXT_PRIVATESIZE`). Reclaimable
+  figures, the clean and delete estimates, and `dsk clean`'s totals and
+  `--min-size` use private bytes; sizes and shares stay allocated bytes.
+  `--json` reports both, as `bytes` and `private_bytes`. Blocks two clones
+  share count as private to neither, so deleting a directory that holds both
+  sides frees more than its private figure says; the figure never promises
+  more than a delete frees. Other filesystems, and other platforms, count
+  every allocated byte as private.
 - Symlinks are measured and never followed, so there are no cycles and no
   double counting through links.
 - Hard-linked files are counted once per `(device, inode)` pair, like `du`.
@@ -220,8 +224,29 @@ directory are counted once, as part of the outer directory.
   footer. Ownership is deterministic for a scan root, but `g` rescans only the
   subtree you enter, so a link whose partner lies outside it is counted there.
 - Unreadable paths are reported and excluded from the totals; the scan does not
-  abort.
+  abort. A directory that cannot be opened is still listed, with nothing in it.
 - Directory inodes count toward their parent, matching `du`.
+
+## How the scan is kept fast
+
+A scan costs one directory listing per directory and nothing per file.
+
+- On macOS each directory is read with `getattrlistbulk(2)`, which returns the
+  type, allocation, device, inode, link count and clone flags of about a
+  thousand entries per call. The portable alternative, `read_dir` plus an
+  `lstat` per entry, makes the kernel resolve every path from `/` again for
+  every file, and the threads doing it contend with each other. Where the bulk
+  call is not available the scan falls back to that, entry by entry.
+- Marker files for artifact detection (`Cargo.toml`, `CACHEDIR.TAG`, ...) and
+  the `.git` file of a linked worktree are read off the same listing.
+- Elsewhere `read_dir` plus metadata is used. On Linux that is already an
+  `fstatat` relative to the open directory, with no path lookup.
+
+On a 16-core Mac, 3.0M files in 173K directories (1.1T, mostly cloned Cargo
+`target/` directories) scan in about 8s, down from 39s; a 670K-file tree that
+fits in the filesystem cache takes 1.4s, down from 11.7s. What remains for the
+large tree is the disk: its metadata does not stay cached, and a scan reads
+about 1.3G of it.
 
 Progress is drawn on stderr only when it is a terminal, so piping the report
 stays clean.

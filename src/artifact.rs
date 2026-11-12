@@ -106,29 +106,39 @@ fn workspace_manifest(target_dir: &Path, file: &str) -> Option<PathBuf> {
     manifest.is_file().then_some(manifest)
 }
 
+/// A marker file whose presence decides what a directory is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Marker {
+    /// A regular file inside the directory.
+    Inside(&'static str),
+    /// A regular file next to the directory, in its parent.
+    Beside(&'static str),
+}
+
 /// Classify `path` if it is a generated directory.
 ///
 /// `path` is known to be a real directory; callers must not pass symlinks.
 pub fn detect(path: &Path, name: &str) -> Option<ArtifactKind> {
+    detect_with(name, |marker| match marker {
+        Marker::Inside(file) => path.join(file).is_file(),
+        Marker::Beside(file) => path.parent().is_some_and(|p| p.join(file).is_file()),
+    })
+}
+
+/// Classify a directory called `name`, asking `exists` about marker files.
+/// A scan answers from directory listings it already holds, which saves a
+/// file lookup or more per directory.
+pub fn detect_with(name: &str, exists: impl Fn(Marker) -> bool) -> Option<ArtifactKind> {
     // Cargo target directories are named `target` by default. Confirm with a
     // sibling manifest so unrelated `target` directories (Android, Maven,
     // make) are not labelled as Rust build output.
     if name == "target"
-        && (path.join(".rustc_info.json").is_file()
-            || path
-                .parent()
-                .map(|p| p.join("Cargo.toml").is_file())
-                .unwrap_or(false))
+        && (exists(Marker::Inside(".rustc_info.json")) || exists(Marker::Beside("Cargo.toml")))
     {
         return Some(ArtifactKind::RustTarget);
     }
 
-    if name == "target"
-        && path
-            .parent()
-            .map(|p| p.join("pom.xml").is_file())
-            .unwrap_or(false)
-    {
+    if name == "target" && exists(Marker::Beside("pom.xml")) {
         return Some(ArtifactKind::MavenTarget);
     }
 
@@ -136,7 +146,7 @@ pub fn detect(path: &Path, name: &str) -> Option<ArtifactKind> {
         return Some(ArtifactKind::NodeModules);
     }
 
-    if matches!(name, ".venv" | "venv" | "env") && path.join("pyvenv.cfg").is_file() {
+    if matches!(name, ".venv" | "venv" | "env") && exists(Marker::Inside("pyvenv.cfg")) {
         return Some(ArtifactKind::PythonVenv);
     }
 
@@ -155,7 +165,7 @@ pub fn detect(path: &Path, name: &str) -> Option<ArtifactKind> {
     }
 
     // https://bford.info/cachedir/
-    if path.join("CACHEDIR.TAG").is_file() {
+    if exists(Marker::Inside("CACHEDIR.TAG")) {
         return Some(ArtifactKind::CacheDir);
     }
 

@@ -1,5 +1,8 @@
 //! Parallel directory walker that records disk usage per directory.
 //!
+//! Each directory is read with one listing (see `listing`) that already
+//! carries every entry's size, so the walk makes no system call per file.
+//!
 //! Sizes are allocated blocks (`st_blocks * 512`), matching what `du` and `df`
 //! report, so sparse files and APFS inline data do not inflate totals.
 //! Symlinks are measured, never followed. Hard-linked files are counted once,
@@ -10,7 +13,7 @@
 //! for APFS clones, which `du` counts once per copy.
 
 use std::collections::HashSet;
-use std::fs::{self, Metadata};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
-use crate::artifact::{self, ArtifactKind};
-use crate::clone::PrivateSizes;
+use crate::artifact::{self, ArtifactKind, Marker};
+use crate::listing::{self, device, disk_usage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeKind {
@@ -153,6 +156,23 @@ pub struct ArtifactDir {
     pub private: u64,
 }
 
+/// How many threads to scan with when the user does not say, or `None` for
+/// one per core.
+///
+/// On macOS more is not faster: threads listing directories contend inside the
+/// kernel, and past eight the time they spend spinning outgrows the extra
+/// work done. Measured on a 16-core machine, a 670K-file tree scanned in 1.4s
+/// with 8 threads and 3.3s with 12 or 16.
+pub fn default_threads() -> Option<usize> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let cores = thread::available_parallelism().map_or(MACOS_THREADS, usize::from);
+    Some(cores.min(MACOS_THREADS))
+}
+
+const MACOS_THREADS: usize = 8;
+
 /// Walk `path` and return an aggregated tree.
 pub fn scan(path: &Path, options: ScanOptions) -> ScanResult {
     let started = Instant::now();
@@ -187,14 +207,16 @@ pub fn scan(path: &Path, options: ScanOptions) -> ScanResult {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
-    let mut root = scanner.scan_dir(path, name.into(), &metadata, false);
+    let mut root = scanner.scan_dir(path, name.into(), disk_usage(&metadata), false, None);
 
     let mut errors = scanner.errors.into_inner().unwrap_or_default();
     errors.sort();
     let error_count = scanner.error_count.load(Ordering::Relaxed);
     let mut artifacts = scanner.artifacts.into_inner().unwrap_or_default();
     dedup_hardlinks(&mut root, &mut artifacts);
-    artifacts.sort_unstable_by_key(|artifact| std::cmp::Reverse(artifact.size));
+    // Largest first, and by path among equals: discovery order depends on how
+    // the scanning threads were scheduled.
+    artifacts.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
     ScanResult {
         stats: ScanStats {
             files: root.files,
@@ -217,118 +239,162 @@ struct Scanner {
     error_count: AtomicU64,
 }
 
+/// Marker files seen in one directory's listing, for artifact detection.
+#[derive(Clone, Copy, Default)]
+struct Markers {
+    cargo_toml: bool,
+    pom_xml: bool,
+    rustc_info: bool,
+    pyvenv_cfg: bool,
+    cachedir_tag: bool,
+}
+
+impl Markers {
+    /// Note `name` if it is a marker. A regular file with exactly the
+    /// marker's name counts. A symlink, or a name that differs only in case
+    /// (the same file on a case-insensitive volume, a different one on a
+    /// case-sensitive volume), is settled by asking `is_file` about the
+    /// marker's own name.
+    fn note(&mut self, name: &str, kind: NodeKind, is_file: impl FnOnce(&str) -> bool) {
+        const MARKERS: [&str; 5] = [
+            "Cargo.toml",
+            "pom.xml",
+            ".rustc_info.json",
+            "pyvenv.cfg",
+            "CACHEDIR.TAG",
+        ];
+        let Some(marker) = MARKERS
+            .into_iter()
+            .find(|marker| marker.eq_ignore_ascii_case(name))
+        else {
+            return;
+        };
+        let present = match kind {
+            NodeKind::File if name == marker => true,
+            NodeKind::File | NodeKind::Symlink => is_file(marker),
+            NodeKind::Dir | NodeKind::Other => false,
+        };
+        let slot = match marker {
+            "Cargo.toml" => &mut self.cargo_toml,
+            "pom.xml" => &mut self.pom_xml,
+            ".rustc_info.json" => &mut self.rustc_info,
+            "pyvenv.cfg" => &mut self.pyvenv_cfg,
+            _ => &mut self.cachedir_tag,
+        };
+        *slot |= present;
+    }
+
+    fn has(&self, file: &str) -> bool {
+        match file {
+            "Cargo.toml" => self.cargo_toml,
+            "pom.xml" => self.pom_xml,
+            ".rustc_info.json" => self.rustc_info,
+            "pyvenv.cfg" => self.pyvenv_cfg,
+            "CACHEDIR.TAG" => self.cachedir_tag,
+            _ => false,
+        }
+    }
+}
+
 impl Scanner {
+    /// Scan the directory at `path`. `own_size` is its own allocation and
+    /// `beside` is what its parent's listing showed, or `None` for the scan
+    /// root, whose parent was not listed.
     fn scan_dir(
         &self,
         path: &Path,
         name: Box<str>,
-        metadata: &Metadata,
+        own_size: u64,
         inside_artifact: bool,
+        beside: Option<Markers>,
     ) -> Node {
         if let Some(progress) = &self.progress {
             progress.dir();
         }
 
-        let mut node = Node::new_dir(name, disk_usage(metadata));
-        let artifact = if inside_artifact {
-            None
-        } else {
-            artifact::detect(path, &node.name)
-        };
-        node.artifact = artifact;
-        let nested = inside_artifact || artifact.is_some();
-
-        let read_dir = match fs::read_dir(path) {
-            Ok(read_dir) => read_dir,
+        let mut node = Node::new_dir(name, own_size);
+        let listing = match listing::read(path) {
+            Ok(listing) => listing,
             Err(error) => {
                 self.record_error(path, &error);
+                if !inside_artifact {
+                    node.artifact = artifact::detect(path, &node.name);
+                }
                 self.record_artifact(path, &mut node);
                 node.roll_up_split();
                 return node;
             }
         };
-
-        let mut dirs: Vec<(PathBuf, Box<str>, Metadata)> = Vec::new();
-        let mut files: Vec<(std::ffi::OsString, Box<str>, Metadata)> = Vec::new();
-        let mut git_file = false;
-        for entry in read_dir {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    self.record_error(path, &error);
-                    continue;
-                }
-            };
-            let child_path = entry.path();
-            // DirEntry::metadata does not follow symlinks, so symlinked
-            // directories are treated as links and never recursed into.
-            match entry.metadata() {
-                Ok(child) if child.is_dir() => {
-                    if self.one_file_system && device(&child) != self.root_device {
-                        continue;
-                    }
-                    let child_name = entry.file_name().to_string_lossy().into_owned();
-                    dirs.push((child_path, child_name.into(), child));
-                }
-                Ok(child) => {
-                    let child_name = entry.file_name().to_string_lossy().into_owned();
-                    git_file |= child_name == ".git" && child.is_file();
-                    files.push((entry.file_name(), child_name.into(), child));
-                }
-                Err(error) => self.record_error(&child_path, &error),
-            }
+        for (path, error) in &listing.errors {
+            self.record_error(path, error);
         }
 
-        // One listing per directory, and only where there are files to size.
-        let private_sizes = if files.iter().any(|(_, _, metadata)| metadata.is_file()) {
-            PrivateSizes::read(path)
-        } else {
-            PrivateSizes::default()
-        };
-        let file_nodes: Vec<Node> = files
-            .into_par_iter()
-            .map(|(file_name, child_name, metadata)| {
-                let kind = if metadata.is_file() {
-                    NodeKind::File
-                } else if metadata.file_type().is_symlink() {
-                    NodeKind::Symlink
-                } else {
-                    NodeKind::Other
-                };
-                let (size, private) = if kind == NodeKind::File {
-                    let size = self.account_file(&metadata);
-                    (size, private_sizes.private(&file_name, size))
-                } else {
-                    let size = disk_usage(&metadata);
-                    (size, size)
-                };
-                Node {
-                    name: child_name,
-                    kind,
-                    size,
-                    private,
-                    files: u64::from(kind == NodeKind::File),
-                    dirs: 0,
-                    reclaimable: 0,
-                    artifact: None,
-                    artifact_id: None,
-                    target_bytes: 0,
-                    worktree_bytes: 0,
-                    worktree: false,
-                    hardlink: inode_key(&metadata),
-                    shared: false,
-                    children: Box::new([]),
+        // Everything below works from the listing alone: no entry costs a
+        // system call of its own.
+        let mut dirs = Vec::new();
+        let mut children = Vec::with_capacity(listing.entries.len());
+        let mut inside = Markers::default();
+        let mut git_file = false;
+        let (mut files, mut file_bytes) = (0, 0);
+        for entry in listing.entries {
+            if entry.kind == NodeKind::Dir {
+                if !self.one_file_system || entry.device == self.root_device {
+                    dirs.push(entry);
                 }
-            })
-            .collect();
+                continue;
+            }
+            inside.note(&entry.name, entry.kind, |marker| {
+                path.join(marker).is_file()
+            });
+            if entry.kind == NodeKind::File {
+                git_file |= &*entry.name == ".git";
+                files += 1;
+                file_bytes += entry.size;
+            }
+            children.push(Node {
+                name: entry.name,
+                kind: entry.kind,
+                size: entry.size,
+                private: entry.private,
+                files: u64::from(entry.kind == NodeKind::File),
+                dirs: 0,
+                reclaimable: 0,
+                artifact: None,
+                artifact_id: None,
+                target_bytes: 0,
+                worktree_bytes: 0,
+                worktree: false,
+                hardlink: entry.hardlink,
+                shared: false,
+                children: Box::new([]),
+            });
+        }
+        if let Some(progress) = &self.progress {
+            progress.files(files, file_bytes);
+        }
 
-        let mut children: Vec<Node> = dirs
+        if !inside_artifact {
+            node.artifact = artifact::detect_with(&node.name, |marker| match (marker, beside) {
+                (Marker::Inside(file), _) => inside.has(file),
+                (Marker::Beside(file), Some(beside)) => beside.has(file),
+                (Marker::Beside(file), None) => {
+                    path.parent().is_some_and(|dir| dir.join(file).is_file())
+                }
+            });
+        }
+        let nested = inside_artifact || node.artifact.is_some();
+
+        let scanned: Vec<Node> = dirs
             .into_par_iter()
-            .map(|(child_path, child_name, child_metadata)| {
-                self.scan_dir(&child_path, child_name, &child_metadata, nested)
+            .map(|entry| {
+                let child_path = path.join(entry.os_name());
+                self.scan_dir(&child_path, entry.name, entry.size, nested, Some(inside))
             })
             .collect();
-        children.extend(file_nodes);
+        children.extend(scanned);
+        // Name order is what decides which path owns a hard-linked file.
+        // Sorting here, on the scanning threads, keeps that pass a plain walk.
+        children.sort_unstable_by(|a, b| a.name.cmp(&b.name));
 
         for child in &children {
             node.size += child.size;
@@ -347,14 +413,6 @@ impl Scanner {
         node.worktree = git_file && crate::git::is_linked_worktree(path);
         node.roll_up_split();
         node
-    }
-
-    fn account_file(&self, metadata: &Metadata) -> u64 {
-        let bytes = disk_usage(metadata);
-        if let Some(progress) = &self.progress {
-            progress.file(bytes);
-        }
-        bytes
     }
 
     fn record_artifact(&self, path: &Path, node: &mut Node) {
@@ -390,6 +448,19 @@ impl Scanner {
 /// match `du` while the choice of owner does not depend on scan scheduling.
 fn dedup_hardlinks(root: &mut Node, artifacts: &mut [ArtifactDir]) {
     dedup_node(root, &mut HashSet::new(), artifacts);
+    largest_first(root);
+}
+
+/// Put every directory's children in display order, largest first. Children
+/// arrive from the scan in name order, and this runs once their sizes are
+/// final.
+fn largest_first(node: &mut Node) {
+    node.children
+        .par_iter_mut()
+        .filter(|child| child.is_dir())
+        .for_each(largest_first);
+    node.children
+        .sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
 }
 
 /// Returns the bytes removed from this subtree, as `(size, private)`, so
@@ -416,9 +487,8 @@ fn dedup_node(
         return (0, 0);
     }
 
-    // Ownership is decided in name order; display order goes back to largest
-    // first once the subtree has been adjusted.
-    node.children.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    // Ownership is decided in name order, which is the order the scan left
+    // the children in.
     let (mut removed, mut removed_private) = (0, 0);
     for child in node.children.iter_mut() {
         let (size, private) = dedup_node(child, seen, artifacts);
@@ -441,43 +511,7 @@ fn dedup_node(
         node.reclaimable = node.children.iter().map(|child| child.reclaimable).sum();
     }
     node.roll_up_split();
-
-    node.children
-        .sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
     (removed, removed_private)
-}
-
-#[cfg(unix)]
-fn disk_usage(metadata: &Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.blocks().saturating_mul(512)
-}
-
-#[cfg(not(unix))]
-fn disk_usage(metadata: &Metadata) -> u64 {
-    metadata.len()
-}
-
-#[cfg(unix)]
-fn inode_key(metadata: &Metadata) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    (metadata.is_file() && metadata.nlink() > 1).then(|| (metadata.dev(), metadata.ino()))
-}
-
-#[cfg(not(unix))]
-fn inode_key(_metadata: &Metadata) -> Option<(u64, u64)> {
-    None
-}
-
-#[cfg(unix)]
-fn device(metadata: &Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.dev()
-}
-
-#[cfg(not(unix))]
-fn device(_metadata: &Metadata) -> u64 {
-    0
 }
 
 /// Live progress line for long scans, drawn on stderr.
@@ -542,8 +576,10 @@ impl Progress {
         self.inner.dirs.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn file(&self, bytes: u64) {
-        self.inner.files.fetch_add(1, Ordering::Relaxed);
+    /// Count the regular files of one directory, in one step so scanning
+    /// threads do not trade the counters back and forth for every file.
+    fn files(&self, files: u64, bytes: u64) {
+        self.inner.files.fetch_add(files, Ordering::Relaxed);
         self.inner.bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 }
@@ -767,7 +803,7 @@ mod tests {
         }
         fs::create_dir_all(main.join("target")).unwrap();
         fs::write(main.join("target/blob"), vec![7u8; 1024 * 1024]).unwrap();
-        assert!(crate::clone::tests::cloned(
+        assert!(crate::listing::tests::cloned(
             &main.join("target"),
             &worktree.join("target")
         ));
@@ -799,6 +835,121 @@ mod tests {
             .unwrap();
         assert_eq!(artifact.size, wt_target.size);
         assert_eq!(artifact.private, wt_target.private);
+    }
+
+    /// Marker files come from the directory listing, where a symlink to a
+    /// manifest still has to count and a directory of that name must not.
+    #[test]
+    fn artifact_markers_are_read_from_the_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let artifact_of = |result: &ScanResult, project: &str, dir: &str| {
+            let project = result
+                .root
+                .children
+                .iter()
+                .find(|child| child.name.as_ref() == project)
+                .unwrap();
+            project
+                .children
+                .iter()
+                .find(|child| child.name.as_ref() == dir)
+                .unwrap()
+                .artifact
+        };
+
+        // A manifest reached through a symlink still marks a cargo project.
+        fs::create_dir_all(root.join("linked/target")).unwrap();
+        fs::write(root.join("real.toml"), "[package]\n").unwrap();
+        std::os::unix::fs::symlink(root.join("real.toml"), root.join("linked/Cargo.toml")).unwrap();
+        // A dangling link, or a directory of that name, does not.
+        fs::create_dir_all(root.join("dangling/target")).unwrap();
+        std::os::unix::fs::symlink("nowhere", root.join("dangling/Cargo.toml")).unwrap();
+        fs::create_dir_all(root.join("dir/target")).unwrap();
+        fs::create_dir_all(root.join("dir/Cargo.toml")).unwrap();
+        // Markers inside the directory itself.
+        fs::create_dir_all(root.join("bare/target")).unwrap();
+        fs::write(root.join("bare/target/.rustc_info.json"), "{}").unwrap();
+        fs::create_dir_all(root.join("py/.venv")).unwrap();
+        fs::write(root.join("py/.venv/pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        fs::create_dir_all(root.join("py/env")).unwrap();
+        fs::create_dir_all(root.join("java/target")).unwrap();
+        fs::write(root.join("java/pom.xml"), "<project/>").unwrap();
+        fs::create_dir_all(root.join("misc/cache")).unwrap();
+        fs::write(root.join("misc/cache/CACHEDIR.TAG"), "Signature: x\n").unwrap();
+
+        let result = scan(root, options());
+        assert_eq!(
+            artifact_of(&result, "linked", "target"),
+            Some(ArtifactKind::RustTarget)
+        );
+        assert_eq!(artifact_of(&result, "dangling", "target"), None);
+        assert_eq!(artifact_of(&result, "dir", "target"), None);
+        assert_eq!(
+            artifact_of(&result, "bare", "target"),
+            Some(ArtifactKind::RustTarget)
+        );
+        assert_eq!(
+            artifact_of(&result, "py", ".venv"),
+            Some(ArtifactKind::PythonVenv)
+        );
+        assert_eq!(artifact_of(&result, "py", "env"), None);
+        assert_eq!(
+            artifact_of(&result, "java", "target"),
+            Some(ArtifactKind::MavenTarget)
+        );
+        assert_eq!(
+            artifact_of(&result, "misc", "cache"),
+            Some(ArtifactKind::CacheDir)
+        );
+
+        // A manifest in another case is the manifest only where the volume
+        // ignores case; the lookup on disk below says which this one is.
+        fs::create_dir_all(root.join("case/target")).unwrap();
+        fs::write(root.join("case/cargo.toml"), "[package]\n").unwrap();
+        fs::create_dir_all(root.join("case/tagged")).unwrap();
+        fs::write(root.join("case/tagged/cachedir.tag"), "Signature: x\n").unwrap();
+        let result = scan(root, options());
+
+        // Every answer matches what a lookup on disk says.
+        for (project, dir) in [
+            ("linked", "target"),
+            ("dangling", "target"),
+            ("dir", "target"),
+            ("bare", "target"),
+            ("py", ".venv"),
+            ("py", "env"),
+            ("java", "target"),
+            ("misc", "cache"),
+            ("case", "target"),
+            ("case", "tagged"),
+        ] {
+            assert_eq!(
+                artifact_of(&result, project, dir),
+                artifact::detect(&root.join(project).join(dir), dir),
+                "{project}/{dir}"
+            );
+        }
+    }
+
+    /// The scan root's parent is never listed, so a `target/` scanned on its
+    /// own still has to find the manifest beside it.
+    #[test]
+    fn a_target_scanned_directly_is_still_an_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("target/debug")).unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "[package]\n").unwrap();
+        fs::write(tmp.path().join("target/debug/blob"), vec![0u8; 64 * 1024]).unwrap();
+        let result = scan(&tmp.path().join("target"), options());
+        assert_eq!(result.root.artifact, Some(ArtifactKind::RustTarget));
+        assert_eq!(result.root.reclaimable, result.root.private);
+    }
+
+    #[test]
+    fn the_default_thread_count_is_capped_only_on_macos() {
+        let threads = default_threads();
+        assert_eq!(threads.is_some(), cfg!(target_os = "macos"));
+        assert!(threads.is_none_or(|threads| (1..=8).contains(&threads)));
     }
 
     #[test]

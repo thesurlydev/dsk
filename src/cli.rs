@@ -44,7 +44,7 @@ pub enum Command {
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct ScanArgs {
-    /// Number of scanning threads (default: one per core)
+    /// Number of scanning threads (default: one per core, at most 8 on macOS)
     #[arg(short, long, value_name = "N")]
     pub threads: Option<usize>,
 

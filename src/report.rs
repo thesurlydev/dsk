@@ -22,6 +22,8 @@ pub enum SortKey {
     Count,
     /// Alphabetical
     Name,
+    /// Modified longest ago first (newest file anywhere inside)
+    Age,
 }
 
 #[derive(Clone, Debug)]
@@ -365,6 +367,7 @@ fn sort_nodes(nodes: &mut [&Node], sort: SortKey) {
             SortKey::Size => b.size.cmp(&a.size),
             SortKey::Count => b.files.cmp(&a.files).then_with(|| b.size.cmp(&a.size)),
             SortKey::Name => a.name.cmp(&b.name),
+            SortKey::Age => a.oldest_first(b).then_with(|| b.size.cmp(&a.size)),
         };
         primary.then_with(|| a.name.cmp(&b.name))
     });
@@ -469,6 +472,12 @@ struct JsonEntry {
     target_bytes: u64,
     /// Bytes in linked git worktrees outside their `target/` directories.
     worktree_bytes: u64,
+    /// When the entry itself was created, in Unix seconds, if the filesystem
+    /// says. A directory's creation says nothing about its contents.
+    created_unix: Option<i64>,
+    /// When anything inside the entry was last modified, in Unix seconds: the
+    /// newest modification time in its subtree.
+    modified_unix: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -528,6 +537,8 @@ pub fn json(
             reclaimable_bytes: node.reclaimable,
             target_bytes: node.target_bytes,
             worktree_bytes: node.worktree_bytes,
+            created_unix: node.created,
+            modified_unix: node.modified,
         })
         .collect();
 
@@ -658,6 +669,13 @@ mod tests {
         assert_eq!(project["name"], "project");
         assert!(project["target_bytes"].as_u64().unwrap() > 0);
         assert_eq!(project["worktree_bytes"], 0);
+        // Freshly written, so modified within the last minute of now.
+        let modified = project["modified_unix"].as_i64().unwrap();
+        assert!((format::unix_now() - modified).abs() < 60);
+        assert_eq!(
+            project["created_unix"].is_i64(),
+            result.root.children[0].created.is_some()
+        );
         // Nothing in the fixture is cloned, so all of it is private.
         assert_eq!(project["private_bytes"], project["bytes"]);
         let candidate = &value["artifacts"]["candidates"][0];

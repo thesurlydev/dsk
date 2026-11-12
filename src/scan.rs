@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use crate::artifact::{self, ArtifactKind, Marker};
-use crate::listing::{self, device, disk_usage};
+use crate::listing::{self, Stamps, device, disk_usage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeKind {
@@ -67,6 +67,13 @@ pub struct Node {
     pub worktree_bytes: u64,
     /// Set when this directory is the top of a linked git worktree.
     pub worktree: bool,
+    /// When this entry itself was created, in seconds since the Unix epoch.
+    /// Says nothing about what is inside a directory.
+    pub created: Option<i64>,
+    /// When anything in this subtree was last modified: the newest of its own
+    /// modification time and its children's, so a directory is as recent as
+    /// the latest file under it.
+    pub modified: Option<i64>,
     /// The `(device, inode)` key of a regular file with more than one link.
     pub hardlink: Option<(u64, u64)>,
     /// True when another path owns this hard-linked file's blocks. The node's
@@ -76,7 +83,7 @@ pub struct Node {
 }
 
 impl Node {
-    fn new_dir(name: Box<str>, own_size: u64) -> Self {
+    fn new_dir(name: Box<str>, own_size: u64, stamps: Stamps) -> Self {
         Self {
             name,
             kind: NodeKind::Dir,
@@ -90,6 +97,8 @@ impl Node {
             target_bytes: 0,
             worktree_bytes: 0,
             worktree: false,
+            created: stamps.created,
+            modified: stamps.modified,
             hardlink: None,
             shared: false,
             children: Box::new([]),
@@ -98,6 +107,17 @@ impl Node {
 
     pub fn is_dir(&self) -> bool {
         self.kind == NodeKind::Dir
+    }
+
+    /// Orders the entry modified longest ago first. An entry with no known
+    /// modification time goes last, since nothing says it is old.
+    pub fn oldest_first(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.modified, other.modified) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
     }
 
     /// Recompute `target_bytes` and `worktree_bytes` from the children and
@@ -182,7 +202,7 @@ pub fn scan(path: &Path, options: ScanOptions) -> ScanResult {
         Ok(metadata) => metadata,
         Err(error) => {
             return ScanResult {
-                root: Node::new_dir(path.display().to_string().into(), 0),
+                root: Node::new_dir(path.display().to_string().into(), 0, Stamps::default()),
                 stats: ScanStats {
                     errors: 1,
                     elapsed: started.elapsed(),
@@ -207,7 +227,14 @@ pub fn scan(path: &Path, options: ScanOptions) -> ScanResult {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
-    let mut root = scanner.scan_dir(path, name.into(), disk_usage(&metadata), false, None);
+    let mut root = scanner.scan_dir(
+        path,
+        name.into(),
+        disk_usage(&metadata),
+        Stamps::of(&metadata),
+        false,
+        None,
+    );
 
     let mut errors = scanner.errors.into_inner().unwrap_or_default();
     errors.sort();
@@ -305,6 +332,7 @@ impl Scanner {
         path: &Path,
         name: Box<str>,
         own_size: u64,
+        stamps: Stamps,
         inside_artifact: bool,
         beside: Option<Markers>,
     ) -> Node {
@@ -312,7 +340,7 @@ impl Scanner {
             progress.dir();
         }
 
-        let mut node = Node::new_dir(name, own_size);
+        let mut node = Node::new_dir(name, own_size, stamps);
         let listing = match listing::read(path) {
             Ok(listing) => listing,
             Err(error) => {
@@ -364,6 +392,8 @@ impl Scanner {
                 target_bytes: 0,
                 worktree_bytes: 0,
                 worktree: false,
+                created: entry.stamps.created,
+                modified: entry.stamps.modified,
                 hardlink: entry.hardlink,
                 shared: false,
                 children: Box::new([]),
@@ -388,7 +418,14 @@ impl Scanner {
             .into_par_iter()
             .map(|entry| {
                 let child_path = path.join(entry.os_name());
-                self.scan_dir(&child_path, entry.name, entry.size, nested, Some(inside))
+                self.scan_dir(
+                    &child_path,
+                    entry.name,
+                    entry.size,
+                    entry.stamps,
+                    nested,
+                    Some(inside),
+                )
             })
             .collect();
         children.extend(scanned);
@@ -401,6 +438,7 @@ impl Scanner {
             node.private += child.private;
             node.files += child.files;
             node.reclaimable += child.reclaimable;
+            node.modified = node.modified.max(child.modified);
             if child.is_dir() {
                 node.dirs += child.dirs + 1;
             }
@@ -632,6 +670,56 @@ mod tests {
             }
         }
         assert_eq!(result.root.size, expected);
+    }
+
+    #[test]
+    fn a_directory_is_as_recent_as_the_newest_file_inside_it() {
+        use crate::listing::tests::set_modified_ago;
+        let tmp = tempfile::tempdir().unwrap();
+        let day = 24 * 3600;
+        let year = 365 * day;
+        for dir in ["stale", "active/deep"] {
+            fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        }
+        fs::write(tmp.path().join("stale/a"), b"x").unwrap();
+        fs::write(tmp.path().join("active/old"), b"x").unwrap();
+        fs::write(tmp.path().join("active/deep/touched"), b"x").unwrap();
+        // Setting a time on a file leaves its directory's alone, so every
+        // directory is aged after what is inside it.
+        set_modified_ago(&tmp.path().join("stale/a"), 3 * year);
+        set_modified_ago(&tmp.path().join("active/old"), 3 * year);
+        set_modified_ago(&tmp.path().join("active/deep/touched"), day);
+        set_modified_ago(&tmp.path().join("active/deep"), 3 * year);
+        set_modified_ago(&tmp.path().join("active"), 3 * year);
+        set_modified_ago(&tmp.path().join("stale"), 3 * year);
+
+        let result = scan(tmp.path(), options());
+        let now = crate::format::unix_now();
+        let ago = |node: &Node| now - node.modified.expect("modified is known");
+
+        let stale = child(&result.root, "stale");
+        assert!((ago(stale) - 3 * year as i64).abs() < 60);
+        let active = child(&result.root, "active");
+        assert!(
+            (ago(active) - day as i64).abs() < 60,
+            "the newest file is a level down"
+        );
+        assert!((ago(child(active, "old")) - 3 * year as i64).abs() < 60);
+        // The scan root was just written to, so it is recent too.
+        assert!(ago(&result.root) < 60);
+    }
+
+    #[test]
+    fn oldest_first_puts_unknown_times_last() {
+        let node = |modified| {
+            let mut node = Node::new_dir("d".into(), 0, Stamps::default());
+            node.modified = modified;
+            node
+        };
+        let mut nodes = [node(None), node(Some(50)), node(Some(10))];
+        nodes.sort_by(Node::oldest_first);
+        let order: Vec<_> = nodes.iter().map(|node| node.modified).collect();
+        assert_eq!(order, [Some(10), Some(50), None]);
     }
 
     #[test]

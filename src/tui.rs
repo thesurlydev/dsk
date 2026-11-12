@@ -18,7 +18,8 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::artifact::{self, ArtifactKind};
 use crate::disk::{self, DiskUsage};
 use crate::format::{
-    bytes, display_path, percent, plural, right, shell_path, truncate_left, truncate_right,
+    age, bytes, date, display_path, percent, plural, right, shell_path, truncate_left,
+    truncate_right, unix_now,
 };
 use crate::git;
 use crate::report::SortKey;
@@ -411,6 +412,12 @@ impl App {
                 SortKey::Name => {
                     order.sort_unstable_by(|a, b| children[*a].name.cmp(&children[*b].name))
                 }
+                SortKey::Age => order.sort_unstable_by(|a, b| {
+                    children[*a]
+                        .oldest_first(&children[*b])
+                        .then_with(|| children[*b].size.cmp(&children[*a].size))
+                        .then_with(|| children[*a].name.cmp(&children[*b].name))
+                }),
             }
             order
         };
@@ -479,7 +486,8 @@ impl App {
                 self.sort = match self.sort {
                     SortKey::Size => SortKey::Count,
                     SortKey::Count => SortKey::Name,
-                    SortKey::Name => SortKey::Size,
+                    SortKey::Name => SortKey::Age,
+                    SortKey::Age => SortKey::Size,
                 };
                 self.refresh();
             }
@@ -1211,6 +1219,7 @@ impl App {
     fn draw_table(&mut self, frame: &mut Frame, area: Rect) {
         let current = self.current();
         let total = current.size;
+        let now = unix_now();
         let rows: Vec<Row> = self
             .order
             .iter()
@@ -1238,6 +1247,8 @@ impl App {
                     Cell::from(bar),
                     self.split_cell(node.target_bytes, 7),
                     self.split_cell(node.worktree_bytes, 8),
+                    self.age_cell(node.modified, now, 8),
+                    self.age_cell(node.created, now, 7),
                     Cell::from(label),
                     Cell::from(Span::styled(tag, Style::new().fg(self.theme.tag()))),
                 ])
@@ -1251,6 +1262,8 @@ impl App {
             Cell::from("usage"),
             Cell::from(right("target", 7)),
             Cell::from(right("worktree", 8)),
+            Cell::from(right("modified", 8)),
+            Cell::from(right("created", 7)),
             Cell::from("name"),
             Cell::from("kind"),
         ])
@@ -1265,6 +1278,8 @@ impl App {
                 Constraint::Length(10),
                 Constraint::Length(7),
                 Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(7),
                 Constraint::Min(10),
                 Constraint::Length(9),
             ],
@@ -1282,7 +1297,7 @@ impl App {
                 ))
                 .block(
                     Block::bordered()
-                        .title(" size    private  share  usage       target  worktree  name"),
+                        .title(" size    private  share  usage       target  worktree  modified  created  name"),
                 ),
                 area,
             );
@@ -1301,6 +1316,18 @@ impl App {
             Style::new().fg(self.theme.muted())
         };
         Cell::from(Span::styled(right(&bytes(node.private), 7), style))
+    }
+
+    /// How long ago a row was modified or created, so old directories stand
+    /// out. A time the filesystem did not report reads as a dim `-`.
+    fn age_cell(&self, stamp: Option<i64>, now: i64, width: usize) -> Cell<'static> {
+        match stamp {
+            Some(then) => Cell::from(right(&age(now, then), width)),
+            None => Cell::from(Span::styled(
+                right("-", width),
+                Style::new().fg(self.theme.muted()),
+            )),
+        }
     }
 
     /// A target or worktree figure for one row; zero reads as a dim `-` so the
@@ -1371,6 +1398,11 @@ impl App {
                     bytes(node.size),
                     percent(node.size, self.current().size),
                 );
+                text.push_str(&format!(
+                    "  modified {}  created {}",
+                    node.modified.map_or("unknown".to_string(), date),
+                    node.created.map_or("unknown".to_string(), date),
+                ));
                 if node.private < node.size {
                     text.push_str(&format!(
                         "  private {} ({} shared with APFS clones)",
@@ -1727,6 +1759,7 @@ fn sort_label(sort: SortKey) -> &'static str {
         SortKey::Size => "size",
         SortKey::Count => "count",
         SortKey::Name => "name",
+        SortKey::Age => "oldest",
     }
 }
 
@@ -1778,6 +1811,56 @@ mod tests {
         app.handle_key(KeyCode::Backspace);
         assert!(app.stack.is_empty());
         assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn rows_show_how_old_they_are_and_s_sorts_oldest_first() {
+        use crate::listing::tests::set_modified_ago;
+        let tmp = tempfile::tempdir().unwrap();
+        let year = 365 * 24 * 3600;
+        for (name, ago, len) in [("fresh", 0, 256 * 1024), ("ancient", 4 * year, 4 * 1024)] {
+            let dir = tmp.path().join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("f"), vec![0u8; len]).unwrap();
+            set_modified_ago(&dir.join("f"), ago);
+            set_modified_ago(&dir, ago);
+        }
+        let result = scan(tmp.path(), ScanOptions::default());
+        let mut app = App::new(result.root, tmp.path(), ScanOptions::default());
+
+        // Size order lists the big fresh directory first.
+        let names = |app: &App| -> Vec<String> {
+            app.order
+                .iter()
+                .map(|index| app.current().children[*index].name.to_string())
+                .collect()
+        };
+        assert_eq!(names(&app), ["fresh", "ancient"]);
+        let screen = screen(&mut app);
+        assert!(
+            screen.contains("modified") && screen.contains("created"),
+            "{screen}"
+        );
+        let ancient = screen
+            .lines()
+            .find(|line| line.contains("ancient/"))
+            .unwrap();
+        assert!(ancient.contains("4y"), "{ancient}");
+        let fresh = screen.lines().find(|line| line.contains("fresh/")).unwrap();
+        assert!(fresh.contains("now"), "{fresh}");
+
+        // size -> count -> name -> oldest
+        for _ in 0..3 {
+            app.handle_key(KeyCode::Char('s'));
+        }
+        assert_eq!(app.sort, SortKey::Age);
+        assert_eq!(names(&app), ["ancient", "fresh"]);
+
+        // The footer gives the exact day for the selected row.
+        select(&mut app, "ancient");
+        let detail = app.detail_text();
+        let then = date(crate::format::unix_now() - 4 * year as i64);
+        assert!(detail.contains(&format!("modified {then}")), "{detail}");
     }
 
     #[test]

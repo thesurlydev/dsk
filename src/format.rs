@@ -1,7 +1,7 @@
 //! Size, count, and duration formatting helpers.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Compact binary size, e.g. `269.3G`, `953.0M`, `512B`.
 pub fn bytes(n: u64) -> String {
@@ -56,6 +56,59 @@ pub fn duration(d: Duration) -> String {
     } else {
         format!("{}ms", d.as_millis())
     }
+}
+
+/// Seconds since the Unix epoch, negative before it.
+pub fn unix_now() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(since) => i64::try_from(since.as_secs()).unwrap_or(i64::MAX),
+        Err(before) => -i64::try_from(before.duration().as_secs()).unwrap_or(i64::MAX),
+    }
+}
+
+/// How long before `now` the Unix time `then` was, in at most four characters:
+/// `now`, `5m`, `3h`, `45d`, `14mo`, `3y`. Months and years are 30 and 365
+/// days. A time in the future, from a skewed clock, reads as `now`.
+pub fn age(now: i64, then: i64) -> String {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    let secs = now.saturating_sub(then).max(0);
+    let days = secs / DAY;
+    if secs < MINUTE {
+        "now".to_string()
+    } else if secs < HOUR {
+        format!("{}m", secs / MINUTE)
+    } else if secs < DAY {
+        format!("{}h", secs / HOUR)
+    } else if days < 60 {
+        format!("{days}d")
+    } else if days < 2 * 365 {
+        format!("{}mo", days / 30)
+    } else {
+        format!("{}y", days / 365)
+    }
+}
+
+/// The UTC calendar date of a Unix time, e.g. `2024-03-09`.
+pub fn date(secs: i64) -> String {
+    // Days since 1970-01-01 to a proleptic Gregorian date, after Howard
+    // Hinnant's `civil_from_days`.
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// Right-align `text` into `width` columns.
@@ -181,6 +234,32 @@ mod tests {
     fn plural_picks_the_right_noun() {
         assert_eq!(plural(1, "dir", "dirs"), "1 dir");
         assert_eq!(plural(2, "dir", "dirs"), "2 dirs");
+    }
+
+    #[test]
+    fn age_picks_the_coarsest_readable_unit() {
+        let now = 1_700_000_000;
+        let ago = |secs: i64| age(now, now - secs);
+        assert_eq!(ago(0), "now");
+        assert_eq!(ago(59), "now");
+        assert_eq!(ago(300), "5m");
+        assert_eq!(ago(3 * 3600), "3h");
+        assert_eq!(ago(45 * 86_400), "45d");
+        assert_eq!(ago(60 * 86_400), "2mo");
+        assert_eq!(ago(14 * 30 * 86_400), "14mo");
+        assert_eq!(ago(2 * 365 * 86_400), "2y");
+        assert_eq!(ago(10 * 365 * 86_400), "10y");
+        assert_eq!(ago(-5000), "now", "the future reads as now");
+    }
+
+    #[test]
+    fn date_is_the_utc_calendar_day() {
+        assert_eq!(date(0), "1970-01-01");
+        assert_eq!(date(86_399), "1970-01-01");
+        assert_eq!(date(86_400), "1970-01-02");
+        assert_eq!(date(951_782_400), "2000-02-29");
+        assert_eq!(date(1_700_000_000), "2023-11-14");
+        assert_eq!(date(-86_400), "1969-12-31");
     }
 
     #[test]

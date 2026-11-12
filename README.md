@@ -68,7 +68,8 @@ Useful `dsk report` flags:
 
 - `--tree` prints an ASCII tree (with `--depth`, default 3).
 - `--top N` sets entries per section (default 10); `--all` shows everything.
-- `--sort size|count|name` orders listings.
+- `--sort size|count|name|age` orders listings. `age` puts the entry modified
+  longest ago first.
 - `--json` emits a machine-readable report, including the exact clean commands.
 - `-x` / `--one-file-system` stays on one filesystem.
 - `-t N` / `--threads N` sets scan parallelism. The default is one thread per
@@ -87,7 +88,7 @@ Plain `dsk` (or `dsk tui`) opens a drill-down browser with the same tree and art
 | `home`, `end` / `G` | jump to start / end |
 | `g` | go to a directory by path |
 | `r` | rescan the current root to pick up changes made outside dsk |
-| `s` | cycle sort: size, file count, name |
+| `s` | cycle sort: size, file count, name, oldest |
 | `f` | show or hide files (directories only) |
 | `t` | toggle the light/dark color theme |
 | `c` | run `cargo clean` for the selected Cargo project or target (asks first) |
@@ -123,7 +124,20 @@ sources and other checked-out files. A linked worktree is a directory whose
 `.git` is a file pointing into a repository's `worktrees/` directory, so the
 main checkout and submodules are not counted; its row carries a `[wt]` tag.
 `dsk report` adds the same split to each top-level entry, and `--json` reports
-it as `target_bytes` and `worktree_bytes`.
+it as `target_bytes` and `worktree_bytes`, and the two dates as `created_unix` and
+`modified_unix`, in Unix seconds (`null` where unknown).
+
+The `modified` and `created` columns say how long ago each row changed, to help
+tell a directory that is old and probably unused from one in use: `now`, `5m`,
+`3h`, `45d`, `14mo`, `3y`. `modified` is the newest modification time of anything
+inside the row, so a directory is as recent as its latest file; a project last
+edited a month ago reads `1mo` however old most of its files are. `created` is
+the row's own birth time, which says nothing about what is inside: a clone,
+copy, or unzip stamps a new date. A filesystem that does not record birth times
+shows `-`. Both come from the directory listing the scan already makes, so they
+cost nothing extra. Build output counts: a `cargo build` makes a project look
+recently modified, so look inside `target/` or sort by `oldest` to see through it.
+The footer gives the selected row's exact dates, in UTC.
 
 The footer shows the selected path, its share of the current directory, and the
 command that would reclaim it. A row whose blocks are counted under another

@@ -19,8 +19,33 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::scan::NodeKind;
+
+/// When an entry was created and last modified, in seconds since the Unix
+/// epoch. Either is `None` where the filesystem does not report it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stamps {
+    pub created: Option<i64>,
+    pub modified: Option<i64>,
+}
+
+impl Stamps {
+    pub fn of(metadata: &Metadata) -> Self {
+        Self {
+            created: metadata.created().ok().map(unix_secs),
+            modified: metadata.modified().ok().map(unix_secs),
+        }
+    }
+}
+
+fn unix_secs(time: SystemTime) -> i64 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(since) => i64::try_from(since.as_secs()).unwrap_or(i64::MAX),
+        Err(before) => -i64::try_from(before.duration().as_secs()).unwrap_or(i64::MAX),
+    }
+}
 
 /// One directory entry. Symlinks are described, never followed.
 #[derive(Debug)]
@@ -40,6 +65,8 @@ pub struct Entry {
     pub device: u64,
     /// The `(device, inode)` key of a regular file with more than one link.
     pub hardlink: Option<(u64, u64)>,
+    /// The entry's own creation and modification times.
+    pub stamps: Stamps,
 }
 
 impl Entry {
@@ -98,6 +125,7 @@ fn portable(dir: &Path) -> io::Result<Listing> {
             private: size,
             device: device(&metadata),
             hardlink: inode_key(&metadata),
+            stamps: Stamps::of(&metadata),
         });
     }
     Ok(listing)
@@ -165,7 +193,7 @@ mod bulk {
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
 
-    use super::{Entry, Listing, device, disk_usage, display_name};
+    use super::{Entry, Listing, Stamps, device, disk_usage, display_name};
     use crate::scan::NodeKind;
 
     /// Per-entry error slot; libc does not export it.
@@ -184,6 +212,8 @@ mod bulk {
         | libc::ATTR_CMN_NAME
         | libc::ATTR_CMN_DEVID
         | libc::ATTR_CMN_OBJTYPE
+        | libc::ATTR_CMN_CRTIME
+        | libc::ATTR_CMN_MODTIME
         | libc::ATTR_CMN_FILEID
         | ATTR_CMN_ERROR;
     const DIR: u32 = libc::ATTR_DIR_MOUNTSTATUS | libc::ATTR_DIR_ALLOCSIZE;
@@ -285,6 +315,13 @@ mod bulk {
             self.take().map(u64::from_ne_bytes)
         }
 
+        /// The seconds of a `timespec`; the nanoseconds are skipped.
+        fn timespec_secs(&mut self) -> Option<i64> {
+            let secs = i64::from_ne_bytes(self.take()?);
+            self.take::<8>()?;
+            Some(secs)
+        }
+
         /// An `attrreference_t` to a NUL-terminated string: an offset from the
         /// reference's own address, and a length that counts the NUL.
         fn string(&mut self) -> Option<&'a CStr> {
@@ -333,6 +370,14 @@ mod bulk {
         if has(common, libc::ATTR_CMN_OBJTYPE) {
             objtype = Some(record.u32()?);
         }
+        let mut created = None;
+        if has(common, libc::ATTR_CMN_CRTIME) {
+            created = Some(record.timespec_secs()?);
+        }
+        let mut modified = None;
+        if has(common, libc::ATTR_CMN_MODTIME) {
+            modified = Some(record.timespec_secs()?);
+        }
         let mut fileid = None;
         if has(common, libc::ATTR_CMN_FILEID) {
             fileid = Some(record.u64()?);
@@ -378,6 +423,7 @@ mod bulk {
                         size: disk_usage(&metadata),
                         device: device(&metadata),
                         hardlink: None,
+                        stamps: Stamps::of(&metadata),
                     }),
                     Err(error) => {
                         listing.errors.push((dir.join(os_name), error));
@@ -391,6 +437,7 @@ mod bulk {
                     size,
                     device,
                     hardlink: None,
+                    stamps: Stamps::default(),
                 }),
                 _ => Fields::from_stat(stat()),
             },
@@ -400,6 +447,7 @@ mod bulk {
                     size,
                     device,
                     hardlink: (links > 1).then_some((device, inode)),
+                    stamps: Stamps::default(),
                 }),
                 _ => Fields::from_stat(stat()),
             },
@@ -411,6 +459,7 @@ mod bulk {
             size,
             device,
             hardlink,
+            stamps,
         } = match entry {
             Ok(fields) => fields,
             Err(error) => {
@@ -418,6 +467,19 @@ mod bulk {
                 return Some(());
             }
         };
+        // The listing's times win; what it left out comes from the stat that
+        // described the entry, or failing that one more `fstatat`.
+        let mut stamps = Stamps {
+            created: created.or(stamps.created),
+            modified: modified.or(stamps.modified),
+        };
+        if (stamps.created.is_none() || stamps.modified.is_none())
+            && let Ok(stat) = stat()
+        {
+            let from_stat = Fields::stamps_of(&stat);
+            stamps.created = stamps.created.or(from_stat.created);
+            stamps.modified = stamps.modified.or(from_stat.modified);
+        }
 
         let private = match (kind, flags) {
             (NodeKind::File, Some(flags)) if flags & EF_MAY_SHARE_BLOCKS == 0 => size,
@@ -437,6 +499,7 @@ mod bulk {
             private,
             device,
             hardlink,
+            stamps,
         });
         Some(())
     }
@@ -447,9 +510,18 @@ mod bulk {
         size: u64,
         device: u64,
         hardlink: Option<(u64, u64)>,
+        /// Times known from a stat; empty when only the listing has them.
+        stamps: Stamps,
     }
 
     impl Fields {
+        fn stamps_of(stat: &libc::stat) -> Stamps {
+            Stamps {
+                created: Some(stat.st_birthtime),
+                modified: Some(stat.st_mtime),
+            }
+        }
+
         fn from_stat(stat: std::io::Result<libc::stat>) -> std::io::Result<Self> {
             let stat = stat?;
             let kind = match stat.st_mode & libc::S_IFMT {
@@ -465,6 +537,7 @@ mod bulk {
                 device,
                 hardlink: (kind == NodeKind::File && stat.st_nlink > 1)
                     .then_some((device, stat.st_ino)),
+                stamps: Self::stamps_of(&stat),
             })
         }
     }
@@ -546,13 +619,20 @@ pub(crate) mod tests {
             .iter()
             .map(|entry| {
                 format!(
-                    "{} {:?} size={} device={} hardlink={:?}",
-                    entry.name, entry.kind, entry.size, entry.device, entry.hardlink
+                    "{} {:?} size={} device={} hardlink={:?} stamps={:?}",
+                    entry.name, entry.kind, entry.size, entry.device, entry.hardlink, entry.stamps
                 )
             })
             .collect();
         lines.sort();
         lines
+    }
+
+    /// Set the modification time of the file or directory at `path`, `ago`
+    /// seconds before now.
+    pub(crate) fn set_modified_ago(path: &Path, ago: u64) {
+        let time = std::time::SystemTime::now() - std::time::Duration::from_secs(ago);
+        fs::File::open(path).unwrap().set_modified(time).unwrap();
     }
 
     /// Clone `from` to `to` with `cp -c`, as tools that seed worktrees do.
@@ -606,6 +686,8 @@ pub(crate) mod tests {
             assert_eq!(entry.device, metadata.dev(), "{name}");
             assert_eq!(entry.os_name(), OsStr::new(name));
             assert_eq!(entry.private, entry.size, "{name}: nothing is cloned");
+            assert_eq!(entry.stamps, Stamps::of(&metadata), "{name}");
+            assert!(entry.stamps.modified.is_some(), "{name}");
         }
 
         let inode = fs::metadata(tmp.path().join("file")).unwrap();
@@ -623,6 +705,22 @@ pub(crate) mod tests {
             summary(&read(tmp.path()).unwrap()),
             summary(&portable(tmp.path()).unwrap())
         );
+    }
+
+    #[test]
+    fn an_entry_reports_the_modification_time_it_was_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("old"), b"x").unwrap();
+        fs::write(tmp.path().join("new"), b"x").unwrap();
+        let year = 365 * 24 * 3600;
+        set_modified_ago(&tmp.path().join("old"), 3 * year);
+
+        let listing = read(tmp.path()).unwrap();
+        let now = crate::format::unix_now();
+        let old = entry(&listing, "old").stamps.modified.unwrap();
+        let new = entry(&listing, "new").stamps.modified.unwrap();
+        assert!((now - old - 3 * year as i64).abs() < 60, "{now} {old}");
+        assert!((now - new).abs() < 60, "{now} {new}");
     }
 
     #[test]

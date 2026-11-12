@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -48,7 +49,8 @@ struct App {
     /// or rescans with `r`.
     scan: ScanOptions,
     /// Capacity of the filesystem holding the directory being viewed. Refreshed
-    /// with the directory listing so it follows navigations.
+    /// with the directory listing so it follows navigations, and every
+    /// `DISK_REFRESH` while idle so it shows space freed or used since.
     disk: Option<DiskUsage>,
     state: TableState,
     quit: bool,
@@ -206,21 +208,29 @@ struct CleanTarget {
     /// The selected directory, shown in the confirmation.
     path: PathBuf,
     manifest: PathBuf,
-    /// Space the scan attributed to this directory before cleaning.
+    /// Space the scan expects cleaning to free: the private bytes of the
+    /// build output.
     estimate: u64,
 }
 
 struct DeleteTarget {
     path: PathBuf,
     kind: NodeKind,
-    /// Space the scan attributed to this entry before deleting it.
+    /// Space the scan attributed to this entry.
+    size: u64,
+    /// The part of `size` deleting it would free; the rest is shared with
+    /// APFS clones elsewhere and stays allocated.
     estimate: u64,
 }
 
 struct GitTarget {
     plan: git::Plan,
-    /// Space the scan attributed to each worktree in `plan.worktrees`.
+    /// Space removing each worktree in `plan.worktrees` would free, from the
+    /// scan's private bytes.
     sizes: Vec<u64>,
+    /// Space the scan attributed to all of those worktrees together, shared
+    /// blocks included.
+    allocated: u64,
 }
 
 impl GitTarget {
@@ -232,17 +242,57 @@ impl GitTarget {
 #[derive(Default)]
 struct Removed {
     size: u64,
+    private: u64,
     files: u64,
     dirs: u64,
     reclaimable: u64,
 }
 
 impl Removed {
+    fn of(node: &Node) -> Self {
+        Self {
+            size: node.size,
+            private: node.private,
+            files: node.files,
+            dirs: if node.is_dir() { node.dirs + 1 } else { 0 },
+            reclaimable: node.reclaimable,
+        }
+    }
+
     fn add(&mut self, other: Self) {
         self.size += other.size;
+        self.private += other.private;
         self.files += other.files;
         self.dirs += other.dirs;
         self.reclaimable += other.reclaimable;
+    }
+
+    /// Take the removed figures off an ancestor of what was removed.
+    fn subtract_from(&self, node: &mut Node) {
+        node.size = node.size.saturating_sub(self.size);
+        node.private = node.private.saturating_sub(self.private);
+        node.files = node.files.saturating_sub(self.files);
+        node.dirs = node.dirs.saturating_sub(self.dirs);
+        node.reclaimable = node.reclaimable.saturating_sub(self.reclaimable);
+        node.roll_up_split();
+    }
+}
+
+/// How often the disk line is read again while the TUI waits for a key.
+const DISK_REFRESH: Duration = Duration::from_secs(1);
+
+/// The confirmation line for space a removal frees, noting the part that stays
+/// because APFS clones elsewhere share it.
+fn frees_line(estimate: u64, allocated: u64) -> String {
+    let shared = allocated.saturating_sub(estimate);
+    if shared == 0 {
+        format!("frees about {}", bytes(estimate))
+    } else {
+        format!(
+            "frees about {}; {} is shared with APFS clones and stays",
+            bytes(estimate),
+            bytes(shared)
+        )
     }
 }
 
@@ -272,6 +322,10 @@ impl App {
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
             terminal.draw(|frame| self.draw(frame))?;
+            if !event::poll(DISK_REFRESH)? {
+                self.refresh_disk();
+                continue;
+            }
             if let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
             {
@@ -370,8 +424,11 @@ impl App {
 
         // Read alongside the listing so the figure follows navigation across
         // mount points and reflects anything just deleted.
-        let path = self.current_path();
-        self.disk = disk::usage(&path);
+        self.refresh_disk();
+    }
+
+    fn refresh_disk(&mut self) {
+        self.disk = disk::usage(&self.current_path());
     }
 
     fn handle_key(&mut self, code: KeyCode) {
@@ -503,7 +560,7 @@ impl App {
             return Some(CleanTarget {
                 path,
                 manifest,
-                estimate: node.size,
+                estimate: node.private,
             });
         }
 
@@ -614,13 +671,15 @@ impl App {
             return;
         };
         let kind = node.kind;
-        let estimate = node.size;
+        let size = node.size;
+        let estimate = node.private;
         let Some(path) = self.selected_path() else {
             return;
         };
         self.modal = Some(Modal::Confirm(Confirmation::Delete(DeleteTarget {
             path,
             kind,
+            size,
             estimate,
         })));
     }
@@ -690,12 +749,24 @@ impl App {
             return;
         }
 
-        let sizes = plan
+        let nodes: Vec<Option<&Node>> = plan
             .worktrees
             .iter()
-            .map(|worktree| self.node_at(&worktree.relative).map_or(0, |node| node.size))
+            .map(|worktree| self.node_at(&worktree.relative))
             .collect();
-        self.modal = Some(Modal::Confirm(Confirmation::Git(GitTarget { plan, sizes })));
+        let sizes = nodes
+            .iter()
+            .map(|node| node.map_or(0, |node| node.private))
+            .collect();
+        let allocated = nodes
+            .iter()
+            .map(|node| node.map_or(0, |node| node.size))
+            .sum();
+        self.modal = Some(Modal::Confirm(Confirmation::Git(GitTarget {
+            plan,
+            sizes,
+            allocated,
+        })));
     }
 
     fn run_git_clean(&mut self, terminal: &mut DefaultTerminal, target: GitTarget) -> Result<()> {
@@ -915,12 +986,7 @@ impl App {
         for mut child in children.into_vec() {
             path.push(&*child.name);
             if path == target {
-                removed.size += child.size;
-                removed.files += child.files;
-                if child.is_dir() {
-                    removed.dirs += child.dirs + 1;
-                }
-                removed.reclaimable += child.reclaimable;
+                removed.add(Removed::of(&child));
             } else {
                 if target.starts_with(&*path) {
                     removed.add(Self::prune_path(&mut child, path, target));
@@ -930,11 +996,7 @@ impl App {
             path.pop();
         }
         node.children = kept.into_boxed_slice();
-        node.size = node.size.saturating_sub(removed.size);
-        node.files = node.files.saturating_sub(removed.files);
-        node.dirs = node.dirs.saturating_sub(removed.dirs);
-        node.reclaimable = node.reclaimable.saturating_sub(removed.reclaimable);
-        node.roll_up_split();
+        removed.subtract_from(node);
         removed
     }
 
@@ -959,10 +1021,7 @@ impl App {
         for mut child in children.into_vec() {
             path.push(&*child.name);
             if child.artifact == Some(ArtifactKind::RustTarget) && !directory_exists(path) {
-                removed.size += child.size;
-                removed.files += child.files;
-                removed.dirs += child.dirs + 1;
-                removed.reclaimable += child.reclaimable;
+                removed.add(Removed::of(&child));
             } else {
                 let nested = Self::prune_node(&mut child, path);
                 removed.add(nested);
@@ -971,11 +1030,7 @@ impl App {
             path.pop();
         }
         node.children = kept.into_boxed_slice();
-        node.size = node.size.saturating_sub(removed.size);
-        node.files = node.files.saturating_sub(removed.files);
-        node.dirs = node.dirs.saturating_sub(removed.dirs);
-        node.reclaimable = node.reclaimable.saturating_sub(removed.reclaimable);
-        node.roll_up_split();
+        removed.subtract_from(node);
         removed
     }
 
@@ -1057,6 +1112,14 @@ impl App {
                 plural(current.files, "file", "files"),
                 plural(current.dirs, "dir", "dirs")
             )),
+            Span::styled(
+                if current.private < current.size {
+                    format!("  |  {} private", bytes(current.private))
+                } else {
+                    String::new()
+                },
+                Style::new().fg(self.theme.accent()),
+            ),
             Span::styled(
                 format!("  |  {} reclaimable here", bytes(current.reclaimable)),
                 Style::new().fg(Color::Green),
@@ -1153,6 +1216,7 @@ impl App {
                         right(&bytes(node.size), 7),
                         Style::new().fg(self.theme.accent()),
                     )),
+                    self.private_cell(node),
                     Cell::from(right(&percent(node.size, total), 6)),
                     Cell::from(bar),
                     self.split_cell(node.target_bytes, 7),
@@ -1165,6 +1229,7 @@ impl App {
 
         let header = Row::new(vec![
             Cell::from(right("size", 7)),
+            Cell::from(right("private", 7)),
             Cell::from(right("share", 6)),
             Cell::from("usage"),
             Cell::from(right("target", 7)),
@@ -1177,6 +1242,7 @@ impl App {
         let table = Table::new(
             rows,
             [
+                Constraint::Length(7),
                 Constraint::Length(7),
                 Constraint::Length(6),
                 Constraint::Length(10),
@@ -1198,7 +1264,8 @@ impl App {
                     Style::new().fg(self.theme.muted()),
                 ))
                 .block(
-                    Block::bordered().title(" size    share  usage       target  worktree  name"),
+                    Block::bordered()
+                        .title(" size    private  share  usage       target  worktree  name"),
                 ),
                 area,
             );
@@ -1206,6 +1273,17 @@ impl App {
         }
         self.state.select(Some(self.selected));
         frame.render_stateful_widget(table, area, &mut self.state);
+    }
+
+    /// What deleting a row would free. It reads dim when nothing in the row is
+    /// shared, so the rows whose size overstates that stand out.
+    fn private_cell(&self, node: &Node) -> Cell<'static> {
+        let style = if node.private < node.size {
+            Style::new()
+        } else {
+            Style::new().fg(self.theme.muted())
+        };
+        Cell::from(Span::styled(right(&bytes(node.private), 7), style))
     }
 
     /// A target or worktree figure for one row; zero reads as a dim `-` so the
@@ -1276,6 +1354,13 @@ impl App {
                     bytes(node.size),
                     percent(node.size, self.current().size),
                 );
+                if node.private < node.size {
+                    text.push_str(&format!(
+                        "  private {} ({} shared with APFS clones)",
+                        bytes(node.private),
+                        bytes(node.size - node.private)
+                    ));
+                }
                 if let Some(kind) = node.artifact {
                     text.push_str(&format!("  [{}]", kind.short()));
                     if let Some(command) = kind.clean_command(&path) {
@@ -1333,8 +1418,9 @@ impl App {
                     format!(
                         "{} of {}",
                         delete_kind_label(target.kind),
-                        bytes(target.estimate)
+                        bytes(target.size)
                     ),
+                    frees_line(target.estimate, target.size),
                     "this cannot be undone".to_string(),
                     String::new(),
                     "y / enter  delete     n / esc  cancel".to_string(),
@@ -1424,15 +1510,10 @@ fn git_confirm_lines(target: &GitTarget, width: usize) -> Vec<String> {
     ];
 
     if !plan.worktrees.is_empty() {
-        let mut heading = format!(
-            "remove {}",
+        lines.push(format!(
+            "remove {} (ignored files go too):",
             plural(plan.worktrees.len() as u64, "worktree", "worktrees")
-        );
-        if target.estimate() > 0 {
-            heading.push_str(&format!(", about {}", bytes(target.estimate())));
-        }
-        heading.push_str(" (ignored files go too):");
-        lines.push(heading);
+        ));
         for (worktree, size) in plan
             .worktrees
             .iter()
@@ -1453,6 +1534,9 @@ fn git_confirm_lines(target: &GitTarget, width: usize) -> Vec<String> {
                 "  (+{} more)",
                 plan.worktrees.len() - GIT_LIST_LIMIT
             ));
+        }
+        if target.allocated > 0 {
+            lines.push(frees_line(target.estimate(), target.allocated));
         }
     }
     if !plan.stale.is_empty() {
@@ -2147,6 +2231,64 @@ mod tests {
         assert!(app.current().size < before);
         assert_eq!(app.current().reclaimable, 0);
         assert_eq!(app.root.reclaimable, 0);
+    }
+
+    /// The reported bug: deleting a worktree seeded with `cp -c` promised its
+    /// whole size, but the disk line barely moved because most of its blocks
+    /// were shared with the main checkout.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn deleting_a_cloned_worktree_promises_only_its_private_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        let worktree = tmp.path().join("worktree");
+        fs::create_dir_all(main.join("target")).unwrap();
+        fs::write(main.join("target/blob"), vec![7u8; 2 * 1024 * 1024]).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        assert!(crate::clone::tests::cloned(
+            &main.join("target"),
+            &worktree.join("target")
+        ));
+        fs::write(worktree.join("notes"), vec![8u8; 128 * 1024]).unwrap();
+
+        let result = scan(tmp.path(), ScanOptions::default());
+        let mut app = App::new(result.root, tmp.path(), ScanOptions::default());
+        select(&mut app, "worktree");
+        let (size, private) = {
+            let node = app.selected_node().unwrap();
+            (node.size, node.private)
+        };
+        assert!(private < size / 4, "{private} of {size}");
+        let (root_size, root_private) = (app.root.size, app.root.private);
+
+        let shown = screen(&mut app);
+        assert!(shown.contains("private"), "{shown}");
+
+        app.handle_key(KeyCode::Char('d'));
+        let shown = screen(&mut app);
+        assert!(
+            shown.contains(&format!("frees about {}", bytes(private))),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(&format!(
+                "{} is shared with APFS clones and stays",
+                bytes(size - private)
+            )),
+            "{shown}"
+        );
+        let Some(Modal::Confirm(Confirmation::Delete(target))) = app.modal.take() else {
+            panic!("expected a confirmation modal");
+        };
+        app.perform_delete(target);
+
+        let Some(Modal::Notice { lines, ok, .. }) = &app.modal else {
+            panic!("expected a result notice");
+        };
+        assert!(ok, "{lines:?}");
+        assert_eq!(lines[1], format!("about {} freed", bytes(private)));
+        assert_eq!(app.root.size, root_size - size);
+        assert_eq!(app.root.private, root_private - private);
     }
 
     #[cfg(unix)]

@@ -164,20 +164,30 @@ fn render_reclaimable(
         return;
     }
 
-    let reclaimable: u64 = artifacts.iter().map(|artifact| artifact.size).sum();
+    let reclaimable: u64 = artifacts.iter().map(|artifact| artifact.private).sum();
     out.push_str(&format!(
         "  {} ({} of scanned space) in {}\n",
         paint.green(&paint.bold(&bytes(reclaimable))),
         percent(reclaimable, total),
         plural(artifacts.len() as u64, "dir", "dirs"),
     ));
+    let allocated: u64 = artifacts.iter().map(|artifact| artifact.size).sum();
+    if allocated > reclaimable {
+        out.push_str(&format!(
+            "  {}\n",
+            paint.dim(&format!(
+                "{} more is shared with APFS clones and stays allocated",
+                bytes(allocated - reclaimable)
+            )),
+        ));
+    }
 
-    for (kind, size, dirs) in group_artifacts(artifacts) {
+    for group in group_artifacts(artifacts) {
         out.push_str(&format!(
             "  {}  {}  {}\n",
-            right(&bytes(size), 7),
-            right(&plural(dirs, "dir", "dirs"), 9),
-            paint.dim(kind.label()),
+            right(&bytes(group.private), 7),
+            right(&plural(group.dirs, "dir", "dirs"), 9),
+            paint.dim(group.kind.label()),
         ));
     }
     let default_clean: u64 = artifacts
@@ -188,7 +198,7 @@ fn render_reclaimable(
                 ArtifactKind::RustTarget | ArtifactKind::NodeModules
             )
         })
-        .map(|artifact| artifact.size)
+        .map(|artifact| artifact.private)
         .sum();
     out.push_str(&format!(
         "  {} {}\n",
@@ -201,8 +211,7 @@ fn render_reclaimable(
         paint.bold(&bytes(total.saturating_sub(default_clean))),
     ));
 
-    let mut candidates: Vec<&ArtifactDir> = artifacts.iter().collect();
-    candidates.sort_unstable_by_key(|artifact| std::cmp::Reverse(artifact.size));
+    let candidates = largest_first(artifacts);
     let limit = options.limit();
     let shown = candidates.len().min(limit);
 
@@ -217,7 +226,7 @@ fn render_reclaimable(
             .unwrap_or_default();
         out.push_str(&format!(
             "  {}  {}\n",
-            right(&bytes(artifact.size), 7),
+            right(&bytes(artifact.private), 7),
             paint.yellow(&command),
         ));
     }
@@ -361,21 +370,38 @@ fn sort_nodes(nodes: &mut [&Node], sort: SortKey) {
     });
 }
 
-fn group_artifacts(artifacts: &[ArtifactDir]) -> Vec<(ArtifactKind, u64, u64)> {
-    let mut groups: Vec<(ArtifactKind, u64, u64)> = Vec::new();
+/// Artifact directories by the space deleting each would free, largest first.
+fn largest_first(artifacts: &[ArtifactDir]) -> Vec<&ArtifactDir> {
+    let mut sorted: Vec<&ArtifactDir> = artifacts.iter().collect();
+    sorted.sort_unstable_by_key(|artifact| std::cmp::Reverse((artifact.private, artifact.size)));
+    sorted
+}
+
+struct ArtifactGroup {
+    kind: ArtifactKind,
+    size: u64,
+    private: u64,
+    dirs: u64,
+}
+
+fn group_artifacts(artifacts: &[ArtifactDir]) -> Vec<ArtifactGroup> {
+    let mut groups: Vec<ArtifactGroup> = Vec::new();
     for artifact in artifacts {
-        match groups
-            .iter_mut()
-            .find(|(kind, _, _)| *kind == artifact.kind)
-        {
-            Some((_, size, dirs)) => {
-                *size += artifact.size;
-                *dirs += 1;
+        match groups.iter_mut().find(|group| group.kind == artifact.kind) {
+            Some(group) => {
+                group.size += artifact.size;
+                group.private += artifact.private;
+                group.dirs += 1;
             }
-            None => groups.push((artifact.kind, artifact.size, 1)),
+            None => groups.push(ArtifactGroup {
+                kind: artifact.kind,
+                size: artifact.size,
+                private: artifact.private,
+                dirs: 1,
+            }),
         }
     }
-    groups.sort_unstable_by_key(|group| std::cmp::Reverse(group.1));
+    groups.sort_unstable_by_key(|group| std::cmp::Reverse((group.private, group.size)));
     groups
 }
 
@@ -434,6 +460,9 @@ struct JsonEntry {
     name: String,
     kind: &'static str,
     bytes: u64,
+    /// The part of `bytes` no file outside this entry shares (APFS clones),
+    /// which is what deleting it would free.
+    private_bytes: u64,
     share_percent: f64,
     reclaimable_bytes: u64,
     /// Bytes in Cargo `target/` directories.
@@ -444,6 +473,7 @@ struct JsonEntry {
 
 #[derive(Serialize)]
 struct JsonArtifacts {
+    /// Space deleting every artifact directory would free.
     total_bytes: u64,
     share_percent: f64,
     groups: Vec<JsonGroup>,
@@ -456,6 +486,7 @@ struct JsonGroup {
     label: &'static str,
     dirs: u64,
     bytes: u64,
+    private_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -463,6 +494,7 @@ struct JsonCandidate {
     kind: &'static str,
     path: String,
     bytes: u64,
+    private_bytes: u64,
     command: Option<String>,
 }
 
@@ -479,7 +511,7 @@ pub fn json(
 ) -> serde_json::Result<String> {
     let total = result.root.size;
     let artifacts = &result.artifacts;
-    let reclaimable: u64 = artifacts.iter().map(|artifact| artifact.size).sum();
+    let reclaimable: u64 = artifacts.iter().map(|artifact| artifact.private).sum();
 
     let mut entries: Vec<&Node> = result.root.children.iter().collect();
     sort_nodes(&mut entries, options.sort);
@@ -491,6 +523,7 @@ pub fn json(
             name: node.name.to_string(),
             kind: if node.is_dir() { "dir" } else { "file" },
             bytes: node.size,
+            private_bytes: node.private,
             share_percent: share(node.size, total),
             reclaimable_bytes: node.reclaimable,
             target_bytes: node.target_bytes,
@@ -500,23 +533,23 @@ pub fn json(
 
     let groups = group_artifacts(artifacts)
         .into_iter()
-        .map(|(kind, bytes, dirs)| JsonGroup {
-            kind: kind.cli_name(),
-            label: kind.label(),
-            dirs,
-            bytes,
+        .map(|group| JsonGroup {
+            kind: group.kind.cli_name(),
+            label: group.kind.label(),
+            dirs: group.dirs,
+            bytes: group.size,
+            private_bytes: group.private,
         })
         .collect();
 
-    let mut candidates: Vec<&ArtifactDir> = artifacts.iter().collect();
-    candidates.sort_unstable_by_key(|artifact| std::cmp::Reverse(artifact.size));
-    let candidates = candidates
+    let candidates = largest_first(artifacts)
         .iter()
         .take(limit)
         .map(|artifact| JsonCandidate {
             kind: artifact.kind.cli_name(),
             path: format::display_path(&artifact.path),
             bytes: artifact.size,
+            private_bytes: artifact.private,
             command: artifact.kind.clean_command(&artifact.path),
         })
         .collect();
@@ -625,6 +658,14 @@ mod tests {
         assert_eq!(project["name"], "project");
         assert!(project["target_bytes"].as_u64().unwrap() > 0);
         assert_eq!(project["worktree_bytes"], 0);
+        // Nothing in the fixture is cloned, so all of it is private.
+        assert_eq!(project["private_bytes"], project["bytes"]);
+        let candidate = &value["artifacts"]["candidates"][0];
+        assert_eq!(candidate["private_bytes"], candidate["bytes"]);
+        assert_eq!(
+            value["artifacts"]["groups"][0]["private_bytes"],
+            value["artifacts"]["groups"][0]["bytes"]
+        );
         assert!(
             value["artifacts"]["candidates"][0]["command"]
                 .as_str()

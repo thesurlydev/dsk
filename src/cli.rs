@@ -140,7 +140,7 @@ pub struct CleanArgs {
     #[arg(long)]
     pub all: bool,
 
-    /// Ignore candidates smaller than this (e.g. 100M)
+    /// Ignore candidates that would free less than this (e.g. 100M)
     #[arg(long, value_name = "SIZE", value_parser = parse_size_arg)]
     pub min_size: Option<u64>,
 }

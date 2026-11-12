@@ -32,9 +32,10 @@ pub fn run(result: &ScanResult, root: &Path, args: &CleanArgs) -> Result<u8> {
         .artifacts
         .iter()
         .filter(|artifact| kinds.contains(&artifact.kind))
-        .filter(|artifact| artifact.size >= args.min_size.unwrap_or(0))
+        .filter(|artifact| artifact.private >= args.min_size.unwrap_or(0))
         .collect();
-    candidates.sort_unstable_by_key(|artifact| std::cmp::Reverse(artifact.size));
+    candidates
+        .sort_unstable_by_key(|artifact| std::cmp::Reverse((artifact.private, artifact.size)));
 
     println!("dsk clean: {}", root.display());
     if candidates.is_empty() {
@@ -42,9 +43,12 @@ pub fn run(result: &ScanResult, root: &Path, args: &CleanArgs) -> Result<u8> {
         return Ok(0);
     }
 
-    let total: u64 = candidates.iter().map(|artifact| artifact.size).sum();
+    // Sizes here are what deleting frees: blocks shared with APFS clones
+    // outside a directory stay allocated after it goes.
+    let total: u64 = candidates.iter().map(|artifact| artifact.private).sum();
+    let allocated: u64 = candidates.iter().map(|artifact| artifact.size).sum();
     println!(
-        "  {} reclaimable in {} ({})\n",
+        "  {} reclaimable in {} ({})",
         bytes(total),
         plural(candidates.len() as u64, "directory", "directories"),
         kinds
@@ -53,13 +57,20 @@ pub fn run(result: &ScanResult, root: &Path, args: &CleanArgs) -> Result<u8> {
             .collect::<Vec<_>>()
             .join(", "),
     );
+    if allocated > total {
+        println!(
+            "  {} more is shared with APFS clones and stays allocated",
+            bytes(allocated - total)
+        );
+    }
+    println!();
 
     let limit = if args.all { usize::MAX } else { 20 };
     let shown = candidates.len().min(limit);
     for artifact in candidates.iter().take(shown) {
         println!(
             "  {}  {}  {}",
-            right(&bytes(artifact.size), 7),
+            right(&bytes(artifact.private), 7),
             right(artifact.kind.short(), 7),
             format::display_path(&artifact.path),
         );
@@ -99,11 +110,11 @@ pub fn run(result: &ScanResult, root: &Path, args: &CleanArgs) -> Result<u8> {
         let path = &artifact.path;
         match delete_one(root, path, artifact.kind) {
             Ok(()) => {
-                freed += artifact.size;
+                freed += artifact.private;
                 deleted += 1;
                 println!(
                     "  deleted  {}  {}",
-                    right(&bytes(artifact.size), 7),
+                    right(&bytes(artifact.private), 7),
                     format::display_path(path),
                 );
             }

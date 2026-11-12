@@ -1,6 +1,7 @@
 mod artifact;
 mod clean;
 mod cli;
+mod clone;
 mod color;
 mod disk;
 mod format;

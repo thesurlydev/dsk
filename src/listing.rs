@@ -1,11 +1,11 @@
 //! One directory's entries, with everything a scan needs to know about each.
 //!
-//! The portable way to get this is `read_dir` plus an `lstat` per entry. On
-//! macOS that is slow for two reasons: `lstat` takes a full path, so the kernel
-//! resolves every component from `/` again for every entry, and threads doing
-//! so contend with each other. `getattrlistbulk(2)` instead returns the
-//! attributes of around a thousand entries of an open directory per call, with
-//! no path lookups at all. Scanning 3M files went from 39s to under 8s.
+//! The portable way to get this is `read_dir` plus a `stat` per entry. On
+//! macOS that is slow because it costs a system call per entry, and threads
+//! making them contend with each other inside the kernel.
+//! `getattrlistbulk(2)` instead returns the attributes of around a thousand
+//! entries of an open directory per call. Scanning 3M files went from 39s to
+//! under 8s.
 //!
 //! The same call reports whether a file shares blocks with APFS clones.
 //! Copy-on-write clones (`cp -c`, `clonefile`) share extents until one side is
@@ -151,37 +151,19 @@ fn kind_of(metadata: &Metadata) -> NodeKind {
     }
 }
 
-#[cfg(unix)]
 pub fn disk_usage(metadata: &Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     metadata.blocks().saturating_mul(512)
 }
 
-#[cfg(not(unix))]
-pub fn disk_usage(metadata: &Metadata) -> u64 {
-    metadata.len()
-}
-
-#[cfg(unix)]
 pub fn device(metadata: &Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     metadata.dev()
 }
 
-#[cfg(not(unix))]
-pub fn device(_metadata: &Metadata) -> u64 {
-    0
-}
-
-#[cfg(unix)]
 fn inode_key(metadata: &Metadata) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     (metadata.is_file() && metadata.nlink() > 1).then(|| (metadata.dev(), metadata.ino()))
-}
-
-#[cfg(not(unix))]
-fn inode_key(_metadata: &Metadata) -> Option<(u64, u64)> {
-    None
 }
 
 #[cfg(target_os = "macos")]

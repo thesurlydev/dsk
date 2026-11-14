@@ -495,15 +495,9 @@ fn parse_worktrees(output: &[u8]) -> Vec<Entry> {
     entries
 }
 
-#[cfg(unix)]
 fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     use std::os::unix::ffi::OsStrExt;
     PathBuf::from(OsStr::from_bytes(bytes))
-}
-
-#[cfg(not(unix))]
-fn bytes_to_path(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 fn short_ref(refname: &str) -> &str {

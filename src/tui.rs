@@ -2420,7 +2420,6 @@ mod tests {
         assert_eq!(app.root.private, root_private - private);
     }
 
-    #[cfg(unix)]
     #[test]
     fn deleting_a_symlink_keeps_its_target() {
         use std::os::unix::fs::symlink;
@@ -2555,7 +2554,6 @@ mod tests {
         assert!(tmp.path().exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn delete_refuses_a_symlink_where_a_directory_was_scanned() {
         use std::os::unix::fs::symlink;

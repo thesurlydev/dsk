@@ -861,7 +861,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join("real")).unwrap();
         fs::write(tmp.path().join("real/data"), vec![0u8; 4096]).unwrap();
-        #[cfg(unix)]
         std::os::unix::fs::symlink(tmp.path().join("real"), tmp.path().join("alias")).unwrap();
 
         let result = scan(tmp.path(), options());

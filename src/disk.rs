@@ -29,9 +29,7 @@ impl DiskUsage {
     }
 }
 
-/// Usage of the filesystem that holds `path`, or `None` when the platform has
-/// no `statvfs` or the call fails.
-#[cfg(unix)]
+/// Usage of the filesystem that holds `path`, or `None` when `statvfs` fails.
 pub fn usage(path: &Path) -> Option<DiskUsage> {
     let stat = rustix::fs::statvfs(path).ok()?;
     // `f_frsize` is the block size that block counts are expressed in; some
@@ -48,11 +46,6 @@ pub fn usage(path: &Path) -> Option<DiskUsage> {
     let used = total.saturating_sub(stat.f_bfree.saturating_mul(unit));
     let free = stat.f_bavail.saturating_mul(unit);
     Some(DiskUsage { total, used, free })
-}
-
-#[cfg(not(unix))]
-pub fn usage(_path: &Path) -> Option<DiskUsage> {
-    None
 }
 
 #[cfg(test)]

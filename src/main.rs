@@ -1,3 +1,6 @@
+#[cfg(not(unix))]
+compile_error!("dsk supports macOS and Linux only");
+
 mod artifact;
 mod clean;
 mod cli;

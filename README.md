@@ -8,38 +8,50 @@
 It is built for trees full of Rust workspaces, where `target/` directories
 routinely account for most of the space. On the machine this was written for,
 `~/projects` held 269.9 GB, of which 248.9 GB was regenerable build output;
-243.5 GB of that was 40 Cargo target directories.
+243.5 GB of that was 40 Cargo target directories. A later scan of the same tree,
+after a cleanup, reads:
 
 ```
-$ dsk report ~/projects
-dsk 0.1.0  /Users/shane/projects
-  269.9G on disk  1,185,755 files  109,068 dirs  5.2s
+$ cd ~/projects
+$ dsk report --top 5
+dsk 0.1.0  ~/projects
+  79.9G on disk  564,992 files  90,942 dirs  1.1s
 
-top-level entries (share of 269.9G)
-   152.0G   56.3%  #########.......                             h1/  (151.8G cleanable)
-    39.8G   14.7%  ##..............                         reader/  (39.5G cleanable)
-    34.6G   12.8%  ##..............                         h1-viz/  (34.6G cleanable)
-    14.0G    5.2%  #...............                           data/
-     6.8G    2.5%  ................                         writer/  (6.8G cleanable)
-  (+200 more entries, 22.7G)
+top-level entries (share of 79.9G)
+    56.4G   70.6%  ###########.....                            app/  (28.3G cleanable; target 56.2G, worktree 28.1M)
+    10.9G   13.7%  ##..............                        app-web/  (10.1G cleanable; target 10.9G, worktree 0B)
+     1.7G    2.1%  ................                            dsk/  (1.6G cleanable; target 1.7G, worktree 0B)
+   668.3M    0.8%  ................                          notes/
+   564.2M    0.7%  ................                           site/  (562.6M cleanable)
+  (+199 more entries, 9.7G)
 
 reclaimable build artifacts
-  248.9G (92.2% of scanned space) in 112 dirs
-   243.5G    40 dirs  cargo target
-     4.2G    27 dirs  node_modules
-   674.0M    15 dirs  maven target
-   435.7M     4 dirs  python venv
+  44.7G (56.0% of scanned space) in 92 dirs
+  29.6G more is shared with APFS clones and stays allocated
+    40.5G    21 dirs  cargo target
+     3.8G    26 dirs  node_modules
+   375.3M    14 dirs  maven target
    103.6M     3 dirs  web build
-   260.0K    23 dirs  python cache
-  space remaining if all are deleted: 21.0G
-  space remaining after `dsk clean` (rust + node): 22.2G
+    52.0M     4 dirs  python venv
+   272.0K    24 dirs  python cache
+  space remaining if all are deleted: 35.1G
+  space remaining after `dsk clean` (rust + node): 35.7G
 
 clean commands (largest first)
-    46.3G  cargo clean --manifest-path h1/.claude/worktrees/sched-m0/Cargo.toml
-    39.2G  cargo clean --manifest-path reader/Cargo.toml
-    34.6G  cargo clean --manifest-path h1-viz/Cargo.toml
-    22.6G  cargo clean --manifest-path h1/.claude/worktrees/untrusted-boundary/Cargo.toml
-    ...
+    19.6G  cargo clean --manifest-path app/worktrees/main-ci/Cargo.toml
+    10.1G  cargo clean --manifest-path app-web/Cargo.toml
+     2.5G  cargo clean --manifest-path app/plugins/fetch/Cargo.toml
+     1.9G  cargo clean --manifest-path app/plugins/images/Cargo.toml
+     1.6G  cargo clean --manifest-path dsk/Cargo.toml
+  (+87 more, use --all to list)
+
+largest directories after cleaning (size minus reclaimable artifacts)
+    28.1G  app
+    14.2G  app/worktrees
+    14.2G  app/worktrees/main-ci
+   827.8M  app-web
+   668.3M  notes
+  (+19668 more)
 ```
 
 ## Install
@@ -55,6 +67,17 @@ cargo build --release
 ./target/release/dsk --help
 ```
 
+Rust 1.88 or newer is required (the crate uses edition 2024).
+
+## Platforms
+
+dsk supports macOS and Linux. Windows is not supported and does not build.
+
+macOS is the primary target. It reads directories with `getattrlistbulk(2)` and
+works out how many bytes APFS clones share, which the rest of the TUI and report
+build on. Linux uses the portable directory walk (`read_dir` plus a `stat`
+relative to the open directory) and treats every allocated byte as private.
+
 ## Usage
 
 ```
@@ -67,7 +90,7 @@ dsk clean [OPTIONS] [PATH]    delete regenerable build output
 Useful `dsk report` flags:
 
 - `--tree` prints an ASCII tree (with `--depth`, default 3).
-- `--top N` sets entries per section (default 10); `--all` shows everything.
+- `--top N` (`-n`) sets entries per section (default 10); `--all` shows everything.
 - `--sort size|count|name|age` orders listings. `age` puts the entry modified
   longest ago first.
 - `--json` emits a machine-readable report, including the exact clean commands.
@@ -83,6 +106,7 @@ Plain `dsk` (or `dsk tui`) opens a drill-down browser with the same tree and art
 | key | action |
 | --- | --- |
 | `j` / `k`, arrows | move |
+| `pgup` / `pgdn` | move one screen |
 | `enter` / `l` / right | open directory |
 | `backspace` / `h` / left | go up |
 | `home`, `end` / `G` | jump to start / end |
@@ -96,25 +120,28 @@ Plain `dsk` (or `dsk tui`) opens a drill-down browser with the same tree and art
 | `w` | remove unused worktrees and branches of the selected git checkout (asks first) |
 | `q` / escape | quit |
 
-The header has two lines. The first is the size, file and directory counts, and
-reclaimable space of the directory being viewed. The second is the capacity of
-the filesystem that directory lives on: how much is in use, a usage bar, and how
-much is still free. It follows the filesystem as you navigate, so scanning one
-project never hides how full the disk is, and it is re-read every second, so
-space freed by a clean or delete, or used by a build elsewhere, shows up without
-a keypress. Used space is the filesystem total minus the free blocks, so used plus
-free is the total; that counts filesystem metadata and reserved space as used,
-which is why it can read slightly higher than `df`'s `Used` column. Free space is
-what a non-root process can still allocate, which is `df`'s `Avail` column. The
-bar drops out on narrow terminals so the free figure stays visible.
+The header has two lines. The first is the size, file and directory
+counts, and reclaimable space of the directory being viewed. The second is the
+capacity of the filesystem that directory lives on: how much is in use, a usage
+bar, and how much is still free. It follows the filesystem as you navigate, so
+scanning one project never hides how full the disk is, and it is re-read every
+second, so space freed by a clean or delete, or used by a build elsewhere, shows
+up without a keypress. Used space is the filesystem total minus the free blocks,
+so used plus free is the total; that counts filesystem metadata and reserved
+space as used, which is why it can read slightly higher than `df`'s `Used`
+column. Free space is what a non-root process can still allocate, which is
+`df`'s `Avail` column. The bar drops out on narrow terminals so the free figure
+stays visible. If the filesystem cannot report its capacity, the second line is
+omitted.
 
 The `private` column is what deleting each row would free: its size minus blocks
 it shares with APFS clones elsewhere (see [How sizes are measured](#how-sizes-are-measured)).
 It reads dim where nothing is shared. Where they differ, the header shows the
 private figure for the directory being viewed, the footer says how much of the
-selection is shared, and the `c`, `d`, and `w` confirmations say how much would
-be freed and how much stays. A worktree whose `target/` was seeded with
-`cp -c` from the main checkout can hold far more than it would free.
+selection is shared, and the `d` and `w` confirmations say how much would be
+freed and how much stays. The `c` confirmation shows the space it expects the
+clean to reclaim. A worktree whose `target/` was seeded with `cp -c` from the
+main checkout can hold far more than it would free.
 
 The `target` and `worktree` columns split each row's size into Cargo `target/`
 directories and linked git worktrees, and the header shows the same split for
@@ -147,7 +174,8 @@ palette, and the footer shows which is active.
 Pressing `c` on a directory that contains a `Cargo.toml`, or on a detected Cargo
 `target/` directory, opens a confirmation modal; confirming runs
 `cargo clean --manifest-path ...` and updates the tree in place. Afterwards the
-highlight returns to the top row, since the rows below shift up.
+highlight returns to the top row, since the rows below shift up. A directory
+with no entries cannot be opened, so the browser never descends into one.
 
 Pressing `d` opens the same kind of confirmation for whatever is selected, file
 or directory, and deletes it once confirmed. Symlinks are unlinked, never
@@ -170,13 +198,14 @@ removed can take a commit with it:
   checked out. The default branch is never deleted.
 
 The confirmation shows each worktree with its size and branch, the branches,
-and a count of what was kept and why. Each worktree and branch is re-checked
-right before removal (HEAD unchanged, still merged), and git itself still
-refuses a worktree with changes. dsk does not fetch, so it judges against the
+and a count of what was kept and why. Lists longer than eight entries are
+truncated with a `(+N more)` line. Each worktree and branch is re-checked right
+before removal (HEAD unchanged, still merged), and git itself still refuses a
+worktree with changes. dsk does not fetch, so it judges against the
 remote-tracking refs as of your last fetch.
 
 Pressing `g` opens a path prompt. The path may be absolute or relative to the
-directory currently on screen, and a leading `~` expands to your home
+directory currently on screen, and a leading `~` or `~/` expands to your home
 directory. On enter, dsk rescans that directory and reopens the browser there.
 If the path cannot be accessed or is not a directory, the prompt stays open
 with the error so it can be corrected.
@@ -200,24 +229,25 @@ must resolve inside the scan root.
 
 | kind | detected by | reclaim with |
 | --- | --- | --- |
-| `cargo target` | `target/` next to `Cargo.toml`, or a cargo `CACHEDIR.TAG` / `.rustc_info.json` | `cargo clean --manifest-path ...` |
-| `maven target` | `target/` next to `pom.xml` | `mvn -f pom.xml clean` |
+| `cargo target` | `target/` next to `Cargo.toml`, or containing `.rustc_info.json` | `cargo clean --manifest-path ...`; `rm -rf` when no manifest is beside it |
+| `maven target` | `target/` next to `pom.xml` | `mvn -q -f pom.xml clean` |
 | `node_modules` | directory name | `rm -rf` |
 | `web build` | `.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache`, `.vite` | `rm -rf` |
 | `python venv` | `.venv`, `venv`, or `env` containing `pyvenv.cfg` | `rm -rf` |
 | `python cache` | `__pycache__`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `.tox`, `.nox` | `rm -rf` |
 | `cachedir` | directory containing `CACHEDIR.TAG` | `rm -rf` |
 
-Detection is deliberately conservative. A directory called `target` that has no
-build manifest beside it is treated as ordinary data, so Android and Make
-output are not reported as Cargo output. Nested artifacts under an artifact
-directory are counted once, as part of the outer directory.
+Detection is deliberately conservative. A directory called `target` with no
+`Cargo.toml` beside it and no `.rustc_info.json` inside is treated as ordinary
+data, so Android and Make output are not reported as Cargo output. `CACHEDIR.TAG`
+is trusted by name; its signature is not validated. Nested artifacts under an
+artifact directory are counted once, as part of the outer directory.
 
 ## How sizes are measured
 
-- Allocated blocks (`st_blocks * 512`), the same metric as `du` and `df`. This
-  matters on APFS, where sparse files would otherwise inflate totals. Totals
-  match `du -sk` byte for byte on the trees tested.
+- Allocated blocks (`st_blocks * 512`), the same metric as `du`. This matters
+  on APFS, where sparse files would otherwise inflate totals. Totals match
+  `du -sk` byte for byte on the trees tested.
 - APFS clones (`cp -c`, `clonefile`) share blocks until one side is written,
   and the allocation counts the shared blocks in every copy, as `du` does. So
   on macOS dsk also works out each file's private bytes: the blocks no other
@@ -229,8 +259,8 @@ directory are counted once, as part of the outer directory.
   `--json` reports both, as `bytes` and `private_bytes`. Blocks two clones
   share count as private to neither, so deleting a directory that holds both
   sides frees more than its private figure says; the figure never promises
-  more than a delete frees. Other filesystems, and other platforms, count
-  every allocated byte as private.
+  more than a delete frees. Linux and other filesystems count every allocated
+  byte as private.
 - Symlinks are measured and never followed, so there are no cycles and no
   double counting through links.
 - Hard-linked files are counted once per `(device, inode)` pair, like `du`.
@@ -239,24 +269,30 @@ directory are counted once, as part of the outer directory.
   even though the file has content. Selecting that row explains it in the
   footer. Ownership is deterministic for a scan root, but `g` rescans only the
   subtree you enter, so a link whose partner lies outside it is counted there.
-- Unreadable paths are reported and excluded from the totals; the scan does not
-  abort. A directory that cannot be opened is still listed, with nothing in it.
+- Unreadable paths are counted and excluded from the totals; the scan does not
+  abort. The count is exact, but only the first few paths are printed. A
+  directory that cannot be opened is still listed, with nothing in it.
 - Directory inodes count toward their parent, matching `du`.
 
 ## How the scan is kept fast
 
-A scan costs one directory listing per directory and nothing per file.
+A scan costs one directory listing per directory and almost nothing per file.
 
 - On macOS each directory is read with `getattrlistbulk(2)`, which returns the
   type, allocation, device, inode, link count and clone flags of about a
-  thousand entries per call. The portable alternative, `read_dir` plus an
-  `lstat` per entry, makes the kernel resolve every path from `/` again for
-  every file, and the threads doing it contend with each other. Where the bulk
-  call is not available the scan falls back to that, entry by entry.
+  thousand entries per call. The portable alternative asks the kernel about each entry
+  with a separate `lstat`, and the threads doing it contend with each other.
+  Where the bulk call is not available the scan falls back to that, entry by
+  entry.
 - Marker files for artifact detection (`Cargo.toml`, `CACHEDIR.TAG`, ...) and
-  the `.git` file of a linked worktree are read off the same listing.
-- Elsewhere `read_dir` plus metadata is used. On Linux that is already an
+  the presence of the `.git` file of a linked worktree are read off the same
+  listing. The `.git` file's contents are read once, when confirming that a
+  directory is a linked worktree.
+- On Linux `read_dir` plus metadata is used, which is already an
   `fstatat` relative to the open directory, with no path lookup.
+- Symlinks, special files and mount points need one extra call each, and a file
+  whose blocks are partly shared needs one to ask for its private size. These
+  are rare enough not to change the one-listing-per-directory shape of a scan.
 
 On a 16-core Mac, 3.0M files in 173K directories (1.1T, mostly cloned Cargo
 `target/` directories) scan in about 8s, down from 39s; a 670K-file tree that
@@ -275,10 +311,10 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The scan is a rayon divide-and-conquer walk: entries are stat'd in parallel per
-directory, subdirectories are scanned in parallel, and results are aggregated
-bottom-up into one tree. A scan of 1.2 million files across 290 GB takes about
-5 seconds and peaks around 250 MB of memory.
+The scan is a rayon divide-and-conquer walk: each directory is listed once, its
+subdirectories are scanned in parallel, and results are aggregated bottom-up into
+one tree. A scan of 1.2 million files across 290 GB takes about 5 seconds and
+peaks around 250 MB of memory.
 
 ## License
 

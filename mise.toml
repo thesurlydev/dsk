@@ -17,3 +17,8 @@ run = "cargo fmt --check"
 [tasks.lint]
 description = "Run clippy with warnings denied"
 run = "cargo clippy --all-targets -- -D warnings"
+
+# `gate` is the name every repo uses for its full pre-commit check.
+[tasks.gate]
+description = "Everything that must pass before committing: formatting, clippy, tests"
+run = [{ task = "fmt" }, { task = "lint" }, { task = "test" }]

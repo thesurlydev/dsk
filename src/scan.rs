@@ -657,7 +657,9 @@ mod tests {
         assert_eq!(result.root.children[0].name.as_ref(), "a");
 
         // The aggregate equals walking every entry with lstat.
-        let mut expected = 0u64;
+        // The root directory counts too, and on a filesystem that allocates
+        // blocks for directories (ext4, overlayfs) it is not free.
+        let mut expected = fs::symlink_metadata(tmp.path()).unwrap().blocks() * 512;
         let mut stack = vec![tmp.path().to_path_buf()];
         while let Some(dir) = stack.pop() {
             for entry in fs::read_dir(&dir).unwrap() {

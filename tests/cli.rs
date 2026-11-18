@@ -45,7 +45,7 @@ fn fixture() -> tempfile::TempDir {
 }
 
 fn allocated_bytes(path: &Path) -> u64 {
-    let mut total = 0;
+    let mut total = fs::symlink_metadata(path).unwrap().blocks() * 512;
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).unwrap() {

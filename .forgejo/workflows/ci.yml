@@ -1,0 +1,48 @@
+# The gate (rustfmt, clippy, tests) on Forgejo Actions at forgejo.surlylabs.net.
+#
+# The runner fleet is Linux/amd64 Docker only, so the macOS-only code paths (getattrlistbulk, APFS
+# clone accounting) are not built here; run `mise run gate` on a Mac before a release.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ forgejo.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: gate (linux-amd64)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v7
+      # The git tests run `git`, and the linker needs a C toolchain.
+      - name: Build tools
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential git
+      - uses: https://github.com/dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.98"
+          components: rustfmt,clippy
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+      - name: Disk left after the build
+        if: always()
+        run: df -h .

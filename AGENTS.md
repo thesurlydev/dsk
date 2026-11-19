@@ -22,7 +22,7 @@ dsk is a disk usage analyzer: one Rust binary (package `dsk`, MSRV 1.88) with a 
 ## Contract
 
 - The `report --json` field names (for example `target_bytes`, `worktree_bytes`, `created_unix`, `modified_unix`) and
-  the `command` strings in it are read by other tools, including h1's `dsk_report` tool (`dsk report --json` and
-  `dsk clean --dry-run`). Add fields freely; do not rename or
+  the `command` strings in it are read by other tools, including wrapper tools that call `dsk report --json` and
+  `dsk clean --dry-run`. Add fields freely; do not rename or
   remove one without checking `tests/cli.rs` and the consumers.
-- `.h1/` is local agent state and is gitignored.
+- Local agent state directories are gitignored.

@@ -1,4 +1,4 @@
-# The gate (rustfmt, clippy, tests) on Forgejo Actions at forgejo.surlylabs.net.
+# The gate (rustfmt, clippy, tests) on Forgejo Actions.
 #
 # The runner fleet is Linux/amd64 Docker only, so the macOS-only code paths (getattrlistbulk, APFS
 # clone accounting) are not built here; run `mise run gate` on a Mac before a release.

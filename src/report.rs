@@ -501,7 +501,7 @@ struct JsonCandidate {
     path: String,
     bytes: u64,
     private_bytes: u64,
-    command: Option<String>,
+    command: String,
 }
 
 #[derive(Serialize)]
@@ -558,7 +558,7 @@ pub fn json(
             path: format::display_path(&artifact.path),
             bytes: artifact.size,
             private_bytes: artifact.private,
-            command: Some(artifact.kind.clean_command(&artifact.path)),
+            command: artifact.kind.clean_command(&artifact.path),
         })
         .collect();
 

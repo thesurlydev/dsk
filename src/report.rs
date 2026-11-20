@@ -222,10 +222,7 @@ fn render_reclaimable(
         paint.bold("clean commands (largest first)")
     ));
     for artifact in candidates.iter().take(shown) {
-        let command = artifact
-            .kind
-            .clean_command(&artifact.path)
-            .unwrap_or_default();
+        let command = artifact.kind.clean_command(&artifact.path);
         out.push_str(&format!(
             "  {}  {}\n",
             right(&bytes(artifact.private), 7),
@@ -561,7 +558,7 @@ pub fn json(
             path: format::display_path(&artifact.path),
             bytes: artifact.size,
             private_bytes: artifact.private,
-            command: artifact.kind.clean_command(&artifact.path),
+            command: Some(artifact.kind.clean_command(&artifact.path)),
         })
         .collect();
 

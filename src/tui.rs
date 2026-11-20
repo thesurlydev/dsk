@@ -260,7 +260,7 @@ impl Removed {
         }
     }
 
-    fn add(&mut self, other: Self) {
+    fn add(&mut self, other: &Self) {
         self.size += other.size;
         self.private += other.private;
         self.files += other.files;
@@ -337,17 +337,17 @@ impl App {
             }
             match self.pending.take() {
                 Some(Action::Confirm(Confirmation::Clean(target))) => {
-                    self.run_clean(terminal, target)?
+                    self.run_clean(terminal, &target)?
                 }
                 Some(Action::Confirm(Confirmation::Delete(target))) => {
-                    self.run_delete(terminal, target)?
+                    self.run_delete(terminal, &target)?
                 }
                 Some(Action::Confirm(Confirmation::Git(target))) => {
-                    self.run_git_clean(terminal, target)?
+                    self.run_git_clean(terminal, &target)?
                 }
-                Some(Action::Go(input)) => self.run_go(terminal, input)?,
+                Some(Action::Go(input)) => self.run_go(terminal, &input)?,
                 Some(Action::Rescan) => self.run_rescan(terminal)?,
-                Some(Action::PlanGit(path)) => self.run_git_plan(terminal, path)?,
+                Some(Action::PlanGit(path)) => self.run_git_plan(terminal, &path)?,
                 None => {}
             }
         }
@@ -584,7 +584,7 @@ impl App {
         self.modal = Some(Modal::Go(GoPrompt::new()));
     }
 
-    fn run_go(&mut self, terminal: &mut DefaultTerminal, input: String) -> Result<()> {
+    fn run_go(&mut self, terminal: &mut DefaultTerminal, input: &str) -> Result<()> {
         self.modal = Some(Modal::Notice {
             title: "go".to_string(),
             lines: vec![
@@ -594,7 +594,7 @@ impl App {
             ok: true,
         });
         terminal.draw(|frame| self.draw(frame))?;
-        self.perform_go(&input);
+        self.perform_go(input);
         Ok(())
     }
 
@@ -711,17 +711,17 @@ impl App {
         }
     }
 
-    fn run_git_plan(&mut self, terminal: &mut DefaultTerminal, path: PathBuf) -> Result<()> {
+    fn run_git_plan(&mut self, terminal: &mut DefaultTerminal, path: &Path) -> Result<()> {
         self.modal = Some(Modal::Notice {
             title: "git cleanup".to_string(),
             lines: vec![
-                format!("checking worktrees and branches in {}", display_path(&path)),
+                format!("checking worktrees and branches in {}", display_path(path)),
                 "this can take a moment".to_string(),
             ],
             ok: true,
         });
         terminal.draw(|frame| self.draw(frame))?;
-        self.perform_git_plan(&path);
+        self.perform_git_plan(path);
         Ok(())
     }
 
@@ -780,7 +780,7 @@ impl App {
         })));
     }
 
-    fn run_git_clean(&mut self, terminal: &mut DefaultTerminal, target: GitTarget) -> Result<()> {
+    fn run_git_clean(&mut self, terminal: &mut DefaultTerminal, target: &GitTarget) -> Result<()> {
         self.modal = Some(Modal::Notice {
             title: "git cleanup".to_string(),
             lines: vec![
@@ -797,7 +797,7 @@ impl App {
         Ok(())
     }
 
-    fn perform_git_clean(&mut self, target: GitTarget) {
+    fn perform_git_clean(&mut self, target: &GitTarget) {
         let outcome = git::execute(&target.plan, &self.root_path);
 
         let mut lines = Vec::new();
@@ -882,7 +882,7 @@ impl App {
         Some(node)
     }
 
-    fn run_clean(&mut self, terminal: &mut DefaultTerminal, target: CleanTarget) -> Result<()> {
+    fn run_clean(&mut self, terminal: &mut DefaultTerminal, target: &CleanTarget) -> Result<()> {
         self.modal = Some(Modal::Notice {
             title: "cargo clean".to_string(),
             lines: vec![
@@ -934,7 +934,7 @@ impl App {
         Ok(())
     }
 
-    fn run_delete(&mut self, terminal: &mut DefaultTerminal, target: DeleteTarget) -> Result<()> {
+    fn run_delete(&mut self, terminal: &mut DefaultTerminal, target: &DeleteTarget) -> Result<()> {
         self.modal = Some(Modal::Notice {
             title: "delete".to_string(),
             lines: vec![
@@ -950,7 +950,7 @@ impl App {
 
     /// Delete the confirmed selection and drop it from the in-memory tree. Split
     /// from `run_delete` so tests can exercise the whole path without a terminal.
-    fn perform_delete(&mut self, target: DeleteTarget) {
+    fn perform_delete(&mut self, target: &DeleteTarget) {
         let (title, ok, mut lines) = match delete_path(&self.root_path, &target.path, target.kind) {
             Ok(()) => {
                 let mut lines = vec![format!("deleted {}", display_path(&target.path))];
@@ -1001,10 +1001,10 @@ impl App {
         for mut child in children.into_vec() {
             path.push(&*child.name);
             if path == target {
-                removed.add(Removed::of(&child));
+                removed.add(&Removed::of(&child));
             } else {
                 if target.starts_with(&*path) {
-                    removed.add(Self::prune_path(&mut child, path, target));
+                    removed.add(&Self::prune_path(&mut child, path, target));
                 }
                 kept.push(child);
             }
@@ -1037,10 +1037,10 @@ impl App {
         for mut child in children.into_vec() {
             path.push(&*child.name);
             if child.artifact == Some(ArtifactKind::RustTarget) && !directory_exists(path) {
-                removed.add(Removed::of(&child));
+                removed.add(&Removed::of(&child));
             } else {
                 let nested = Self::prune_node(&mut child, path);
-                removed.add(nested);
+                removed.add(&nested);
                 kept.push(child);
             }
             path.pop();
@@ -1400,8 +1400,8 @@ impl App {
                 );
                 text.push_str(&format!(
                     "  modified {}  created {}",
-                    node.modified.map_or("unknown".to_string(), date),
-                    node.created.map_or("unknown".to_string(), date),
+                    node.modified.map_or_else(|| "unknown".to_string(), date),
+                    node.created.map_or_else(|| "unknown".to_string(), date),
                 ));
                 if node.private < node.size {
                     text.push_str(&format!(
@@ -1412,9 +1412,7 @@ impl App {
                 }
                 if let Some(kind) = node.artifact {
                     text.push_str(&format!("  [{}]", kind.short()));
-                    if let Some(command) = kind.clean_command(&path) {
-                        text.push_str(&format!("  {command}"));
-                    }
+                    text.push_str(&format!("  {}", kind.clean_command(&path)));
                 }
                 if node.target_bytes > 0 || node.worktree_bytes > 0 {
                     text.push_str(&format!(
@@ -2297,7 +2295,7 @@ mod tests {
             "confirming must not delete anything by itself"
         );
 
-        app.perform_delete(target);
+        app.perform_delete(&target);
         assert!(!file.exists());
         assert_eq!(app.selected, 0, "the highlight returns to the top row");
         assert!(
@@ -2327,7 +2325,7 @@ mod tests {
         let Some(Modal::Confirm(Confirmation::Delete(target))) = app.modal.take() else {
             panic!("expected a confirmation modal");
         };
-        app.perform_delete(target);
+        app.perform_delete(&target);
 
         assert!(!dir.join("b").exists());
         assert_eq!(app.selected, 0, "the highlight returns to the top row");
@@ -2347,7 +2345,7 @@ mod tests {
         let Some(Modal::Confirm(Confirmation::Delete(target))) = app.modal.take() else {
             panic!("expected a confirmation modal");
         };
-        app.perform_delete(target);
+        app.perform_delete(&target);
 
         assert!(!tmp.path().join("project/target").exists());
         assert_eq!(app.selected, 0, "the highlight returns to the top row");
@@ -2409,7 +2407,7 @@ mod tests {
         let Some(Modal::Confirm(Confirmation::Delete(target))) = app.modal.take() else {
             panic!("expected a confirmation modal");
         };
-        app.perform_delete(target);
+        app.perform_delete(&target);
 
         let Some(Modal::Notice { lines, ok, .. }) = &app.modal else {
             panic!("expected a result notice");
@@ -2439,7 +2437,7 @@ mod tests {
         let Some(Modal::Confirm(Confirmation::Delete(delete))) = app.modal.take() else {
             panic!("expected a confirmation modal");
         };
-        app.perform_delete(delete);
+        app.perform_delete(&delete);
 
         assert!(fs::symlink_metadata(tmp.path().join("dir/link")).is_err());
         assert!(target.exists(), "the link target must survive");
@@ -2492,7 +2490,7 @@ mod tests {
         let Some(Action::Confirm(Confirmation::Git(target))) = app.pending.take() else {
             panic!("cleanup queued");
         };
-        app.perform_git_clean(target);
+        app.perform_git_clean(&target);
 
         let Some(Modal::Notice { title, ok, lines }) = &app.modal else {
             panic!("expected a result notice");

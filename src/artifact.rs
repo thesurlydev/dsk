@@ -61,23 +61,22 @@ impl ArtifactKind {
     }
 
     /// The command a person would run to reclaim this directory.
-    pub fn clean_command(self, path: &Path) -> Option<String> {
+    pub fn clean_command(self, path: &Path) -> String {
         match self {
             ArtifactKind::RustTarget => match workspace_manifest(path, "Cargo.toml") {
-                Some(manifest) => Some(format!(
+                Some(manifest) => format!(
                     "cargo clean --manifest-path {}",
                     crate::format::shell_path(&manifest)
-                )),
-                None => Some(format!("rm -rf {}", crate::format::shell_path(path))),
+                ),
+                None => format!("rm -rf {}", crate::format::shell_path(path)),
             },
             ArtifactKind::MavenTarget => match workspace_manifest(path, "pom.xml") {
-                Some(manifest) => Some(format!(
-                    "mvn -q -f {} clean",
-                    crate::format::shell_path(&manifest)
-                )),
-                None => Some(format!("rm -rf {}", crate::format::shell_path(path))),
+                Some(manifest) => {
+                    format!("mvn -q -f {} clean", crate::format::shell_path(&manifest))
+                }
+                None => format!("rm -rf {}", crate::format::shell_path(path)),
             },
-            _ => Some(format!("rm -rf {}", crate::format::shell_path(path))),
+            _ => format!("rm -rf {}", crate::format::shell_path(path)),
         }
     }
 
@@ -207,9 +206,7 @@ mod tests {
             detect(&project.join("target"), "target"),
             Some(ArtifactKind::MavenTarget)
         );
-        let command = ArtifactKind::MavenTarget
-            .clean_command(&project.join("target"))
-            .unwrap();
+        let command = ArtifactKind::MavenTarget.clean_command(&project.join("target"));
         assert!(command.contains("mvn") && command.contains("pom.xml"));
     }
 

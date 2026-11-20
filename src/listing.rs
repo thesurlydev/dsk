@@ -555,8 +555,10 @@ mod bulk {
     /// The bytes of `name`, inside the open directory, that no other file
     /// shares, if the filesystem reports them.
     fn private_size(fd: &OwnedFd, name: &CStr) -> Option<u64> {
-        // SAFETY: both are plain C structs for which all-zero is valid.
+        // SAFETY: `attrlist` is a plain C struct for which all-zero is valid.
         let mut request: libc::attrlist = unsafe { std::mem::zeroed() };
+        // SAFETY: `PrivateSize` is a packed struct of integers and plain C
+        // structs, so all-zero is a valid value.
         let mut reply: PrivateSize = unsafe { std::mem::zeroed() };
         request.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
         request.commonattr = libc::ATTR_CMN_RETURNED_ATTRS;

@@ -311,7 +311,7 @@ impl Markers {
         *slot |= present;
     }
 
-    fn has(&self, file: &str) -> bool {
+    fn has(self, file: &str) -> bool {
         match file {
             "Cargo.toml" => self.cargo_toml,
             "pom.xml" => self.pom_xml,

@@ -16,7 +16,7 @@ impl Paint {
         Self::new(!force_off && is_tty && env_allows)
     }
 
-    fn wrap(&self, code: &str, text: &str) -> String {
+    fn wrap(self, code: &str, text: &str) -> String {
         if self.enabled {
             format!("\x1b[{code}m{text}\x1b[0m")
         } else {
@@ -24,23 +24,23 @@ impl Paint {
         }
     }
 
-    pub fn bold(&self, text: &str) -> String {
+    pub fn bold(self, text: &str) -> String {
         self.wrap("1", text)
     }
 
-    pub fn dim(&self, text: &str) -> String {
+    pub fn dim(self, text: &str) -> String {
         self.wrap("2", text)
     }
 
-    pub fn cyan(&self, text: &str) -> String {
+    pub fn cyan(self, text: &str) -> String {
         self.wrap("36", text)
     }
 
-    pub fn green(&self, text: &str) -> String {
+    pub fn green(self, text: &str) -> String {
         self.wrap("32", text)
     }
 
-    pub fn yellow(&self, text: &str) -> String {
+    pub fn yellow(self, text: &str) -> String {
         self.wrap("33", text)
     }
 }
